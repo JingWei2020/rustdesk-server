@@ -497,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
         <p>或使用口令 + 动态码登录：</p>{WA_JS}"""
         return page("控制台双因素验证", f"""
         <h1>RustDesk 控制台 · 双因素验证</h1>
-        <p>通过本网关后，还需再完成控制台自身的账号登录。</p>{e}{wa}
+        <p>安全密钥登录通过后将直达控制台；口令 + 动态码通过后，还需再完成控制台自身的账号登录。</p>{e}{wa}
         <form method="post" action="/gate/login">
           <label>网关口令</label>
           <input type="password" name="password" autocomplete="current-password" required>
