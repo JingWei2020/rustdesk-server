@@ -3,6 +3,28 @@
 这是 [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) 的 fork，
 在官方 **1.1.16** 基础上给 `hbbs` 打了补丁（分支 `ws-1.1.16`），并提供一键安装脚本。
 
+## 多中继与就近选择（补丁 v3，路线图 #10）
+
+hbbs 的 `-r` 本就接受逗号分隔的中继列表，上游自带健康检查
+（`check_relay_servers` 周期性探测，不可达的中继自动从下发列表剔除、恢复后自动加回）。
+原版的选择逻辑是无脑轮换；补丁 v3 把 `get_relay_server(双方IP)` 改为地理就近：
+
+- 按双方公网 IP 查国家（MMDB 格式国家库，默认工作目录下
+  `geoip/dbip-country.mmdb`，或 `GEOIP_MMDB_PATH` 指定；用的是 DB-IP 免费
+  国家库，CC BY 4.0），中继国家同理按其 IP 查；
+- 分级：与任一端同国家 = 0 级，同大区（亚太/美洲/欧非中东）= 1 级，其他 = 2 级；
+  取最低级、同级内轮换；无定位信息时退化为全体轮换（与原版一致）；
+- 中继国家可用 `RELAY_GEO_OVERRIDES="host:port=CC,..."` 显式覆盖
+  （云 IP 的地理库定位常有偏差）；
+- 每次选择打一行 INFO 日志 `relay select: peers <ip>(<国家>) ... -> <中继> (tier N)`；
+- 本地验证：连 hbbs 的 21115 端口（仅回环）发文本命令 `tg <ip1> <ip2>`
+  可直接看到任选两个 IP 时会下发哪个中继；`rs` 列出当前生效的中继列表。
+
+部署一个新中继节点：同一 Release 的 hbbr 二进制 + 与 hbbs 相同的
+`id_ed25519` 密钥对（放工作目录）+ systemd `hbbr -k _`，防火墙放行
+21117/tcp（与 21119/tcp），然后把 `host:21117` 追加进 hbbs 的 `-r` 列表重启即可。
+生产现状：DC-02 与 DC-03 双中继（均洛杉矶）；亚太中继待亚洲服务器的公网端口确认。
+
 ## 为什么打补丁
 
 开源版 hbbs 的 TCP/WebSocket 通道对注册请求（RegisterPk）写死返回 `NOT_SUPPORT`：

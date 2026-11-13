@@ -18,7 +18,7 @@
 | 7 | 控制台双因素认证（2FA） | ◐ | 独立 TOTP 网关（本仓库 gate/）以 Nginx auth_request 保护 /_admin/ 与 /api/admin/：未注册时放行、管理员经一次性链接自设口令+录入 TOTP 后强制生效，与控制台自身登录构成双层防护；2026-11-13 部署 DC-02，全流程在同构测试实例验证通过，生产待管理员完成一次性注册 |
 | 8 | OIDC / LDAP 单点登录 | ✅ | lejianwen 支持 GitHub / Google / OIDC 授权登录与 LDAP（AD、OpenLDAP），部署时配置即可 |
 | 9 | API 令牌（细粒度权限） | ✅ | 本仓库 strategy/ 服务已实现：Pro 词汇权限表的作用域令牌（签发/列表/吊销/过期，哈希落库），覆盖 strategies/devices/users/user-groups/device-groups/audits 读写校验；官方 res/strategies.py 与 res/devices.py 已用作用域令牌在生产实测通过（2026-11-13） |
-| 10 | 多中继节点 + 自动就近调度 | ⏳ | hbbs/hbbr 层实现：多 hbbr 注册、心跳与按延迟/负载下发 |
+| 10 | 多中继节点 + 自动就近调度 | ◐ | 已实现并上线（补丁 v3）：hbbs 支持多中继列表（上游自带健康剔除），选择逻辑由轮换改为按双方 IP 国家/大区分级就近（MMDB 国家库，RELAY_GEO_OVERRIDES 可覆盖），每次选择有日志、可用控制台 tg 命令验证；生产已双中继（DC-02+DC-03，均洛杉矶）并演练过故障剔除/恢复。剩余：亚太中继节点待一台有可用公网端口的亚洲服务器（SG/HK NAT 的端口映射未确认），加上后中国侧连接即可就近走亚太（hbbs 参数加一项，无需改代码） |
 | 11 | WSS（WebSocket over TLS） | ◐ | Web 客户端可配 wss Host；桌面客户端 WSS 经反向代理终止，待集成验证 |
 | 12 | 定制客户端生成 | ◐ | 已用单文件安装包平替（官方 1.5.3 + magic 文件名 + 装后写配置）；控制台一键生成待做 |
 | 13 | 自托管 Web 客户端（浏览器远控） | ◐ | lejianwen 自带 Web Client：自动同步 API/ID/Key/地址簿，支持游客临时分享链接；非官方实现 |

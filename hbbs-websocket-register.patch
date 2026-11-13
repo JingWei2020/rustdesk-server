@@ -1,8 +1,121 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e5162ee..3719f61 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,7 @@ hbb_common = { path = "libs/hbb_common" }
+ serde_derive = "1.0"
+ serde = "1.0"
+ serde_json = "1.0"
++maxminddb = "=0.24.0"
+ lazy_static = "1.4"
+ clap = "2"
+ rust-ini = "0.18"
 diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
-index dff45eb..e08107d 100644
+index dff45eb..20dcac0 100644
 --- a/src/rendezvous_server.rs
 +++ b/src/rendezvous_server.rs
-@@ -82,6 +82,7 @@ struct Inner {
+@@ -57,6 +57,100 @@ enum Sink {
+ type Sender = mpsc::UnboundedSender<Data>;
+ type Receiver = mpsc::UnboundedReceiver<Data>;
+ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
++
++// ---- 多中继地理定位（补丁 v3）----
++// 国家库：MaxMind MMDB 格式（默认 geoip/dbip-country.mmdb，相对 hbbs 工作目录；
++// 或环境变量 GEOIP_MMDB_PATH 指定）。用 DB-IP 免费国家库（CC BY 4.0）即可，
++// 只取 country.iso_code / country.code。库缺失时所有查询返回 None，
++// get_relay_server 自动退化为轮换选择，不影响可用性。
++static GEOIP_READER: once_cell::sync::OnceCell<Option<maxminddb::Reader<Vec<u8>>>> =
++    once_cell::sync::OnceCell::new();
++static RELAY_CC_CACHE: std::sync::Mutex<Option<HashMap<String, Option<String>>>> =
++    std::sync::Mutex::new(None);
++
++fn geoip_country(ip: IpAddr) -> Option<String> {
++    let reader = GEOIP_READER.get_or_init(|| {
++        let path = std::env::var("GEOIP_MMDB_PATH")
++            .unwrap_or_else(|_| "geoip/dbip-country.mmdb".to_owned());
++        match maxminddb::Reader::open_readfile(&path) {
++            Ok(r) => {
++                log::info!("geoip db loaded: {}", path);
++                Some(r)
++            }
++            Err(e) => {
++                log::info!("geoip db unavailable ({}): {}", path, e);
++                None
++            }
++        }
++    });
++    let reader = reader.as_ref()?;
++    let v: serde_json::Value = reader.lookup(ip).ok()?;
++    let country = v.get("country")?;
++    let code = country
++        .get("iso_code")
++        .or_else(|| country.get("code"))?
++        .as_str()?;
++    Some(code.to_uppercase())
++}
++
++fn region_of(cc: &str) -> &'static str {
++    match cc {
++        "CN" | "HK" | "TW" | "JP" | "KR" | "SG" | "MY" | "TH" | "VN" | "PH" | "ID" | "IN"
++        | "AU" | "NZ" | "MM" | "KH" | "LA" | "BN" => "APAC",
++        "US" | "CA" | "MX" | "BR" | "AR" | "CL" | "CO" | "PE" => "AMER",
++        "GB" | "DE" | "FR" | "NL" | "SE" | "NO" | "DK" | "FI" | "ES" | "IT" | "PT" | "IE"
++        | "CH" | "AT" | "BE" | "PL" | "CZ" | "RO" | "HU" | "GR" | "UA" | "RU" | "TR" | "IL"
++        | "EG" | "ZA" | "NG" | "KE" | "MA" | "AE" | "SA" => "EMEA",
++        _ => "OTHER",
++    }
++}
++
++// 中继国家默认按其 IP 查库；可用环境变量 RELAY_GEO_OVERRIDES 显式覆盖
++// （格式 "host:port=CC,..."），云厂商 IP 地理定位常有偏差，覆盖优先于查库。
++// 注意：覆盖走环境变量而不是写进中继列表——列表条目要过上游的地址合法性校验，
++// 且健康检查直接拿条目当套接字地址用，任何后缀都会让中继被误判失效。
++fn relay_country(relay: &str) -> Option<String> {
++    {
++        let mut cache = RELAY_CC_CACHE.lock().unwrap();
++        let map = cache.get_or_insert_with(HashMap::new);
++        if let Some(v) = map.get(relay) {
++            return v.clone();
++        }
++    }
++    let result = relay_country_uncached(relay);
++    let mut cache = RELAY_CC_CACHE.lock().unwrap();
++    cache
++        .get_or_insert_with(HashMap::new)
++        .insert(relay.to_owned(), result.clone());
++    result
++}
++
++fn relay_country_uncached(relay: &str) -> Option<String> {
++    // 显式覆盖优先：环境变量 RELAY_GEO_OVERRIDES，格式 "host:port=CC,host2:port2=CC"
++    // （云厂商 IP 的地理库定位常有偏差，覆盖表说了算；不影响中继列表本身的合法性校验）
++    if let Ok(ov) = std::env::var("RELAY_GEO_OVERRIDES") {
++        for part in ov.split(',') {
++            if let Some((k, v)) = part.rsplit_once('=') {
++                if k.trim() == relay {
++                    let cc = v.trim().to_uppercase();
++                    if cc.len() == 2 {
++                        return Some(cc);
++                    }
++                }
++            }
++        }
++    }
++    let host = relay.rsplit_once(':')?.0;
++    let host = host.trim_start_matches('[').trim_end_matches(']');
++    let ip: IpAddr = match host.parse() {
++        Ok(ip) => ip,
++        Err(_) => {
++            use std::net::ToSocketAddrs;
++            (host, 0u16).to_socket_addrs().ok()?.next()?.ip()
++        }
++    };
++    geoip_country(ip)
++}
+ type RelayServers = Vec<String>;
+ const CHECK_RELAY_TIMEOUT: u64 = 3_000;
+ static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+@@ -82,6 +176,7 @@ struct Inner {
  #[derive(Clone)]
  pub struct RendezvousServer {
      tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
@@ -10,7 +123,7 @@ index dff45eb..e08107d 100644
      pm: PeerMap,
      tx: Sender,
      relay_servers: Arc<RelayServers>,
-@@ -129,6 +130,7 @@ impl RendezvousServer {
+@@ -129,6 +224,7 @@ impl RendezvousServer {
          };
          let mut rs = Self {
              tcp_punch: Arc::new(Mutex::new(HashMap::new())),
@@ -18,7 +131,7 @@ index dff45eb..e08107d 100644
              pm,
              tx: tx.clone(),
              relay_servers: Default::default(),
-@@ -479,6 +481,7 @@ impl RendezvousServer {
+@@ -479,6 +575,7 @@ impl RendezvousServer {
          addr: SocketAddr,
          key: &str,
          ws: bool,
@@ -26,7 +139,7 @@ index dff45eb..e08107d 100644
      ) -> bool {
          if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
              match msg_in.union {
-@@ -500,7 +503,7 @@ impl RendezvousServer {
+@@ -500,7 +597,7 @@ impl RendezvousServer {
                          rf.socket_addr = AddrMangle::encode(addr).into();
                          msg_out.set_request_relay(rf);
                          let peer_addr = peer.read().await.socket_addr;
@@ -35,7 +148,7 @@ index dff45eb..e08107d 100644
                      }
                      return true;
                  }
-@@ -545,19 +548,159 @@ impl RendezvousServer {
+@@ -545,19 +642,159 @@ impl RendezvousServer {
                      msg_out.set_test_nat_response(res);
                      Self::send_to_sink(sink, msg_out).await;
                  }
@@ -199,7 +312,7 @@ index dff45eb..e08107d 100644
      }
  
      #[inline]
-@@ -818,6 +961,40 @@ impl RendezvousServer {
+@@ -818,6 +1055,40 @@ impl RendezvousServer {
          });
      }
  
@@ -240,7 +353,7 @@ index dff45eb..e08107d 100644
      #[inline]
      async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
          if let Some(sink) = sink.as_mut() {
-@@ -855,7 +1032,7 @@ impl RendezvousServer {
+@@ -855,7 +1126,7 @@ impl RendezvousServer {
      ) -> ResultType<()> {
          let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
          if let Some(addr) = to_addr {
@@ -249,7 +362,7 @@ index dff45eb..e08107d 100644
          } else {
              self.send_to_tcp_sync(msg, addr).await?;
          }
-@@ -870,13 +1047,12 @@ impl RendezvousServer {
+@@ -870,13 +1141,12 @@ impl RendezvousServer {
          key: &str,
      ) -> ResultType<()> {
          let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
@@ -269,7 +382,64 @@ index dff45eb..e08107d 100644
          Ok(())
      }
  
-@@ -1169,22 +1345,52 @@ impl RendezvousServer {
+@@ -916,14 +1186,53 @@ impl RendezvousServer {
+         self.relay_servers = self.relay_servers0.clone();
+     }
+ 
+-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
++    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
+         if self.relay_servers.is_empty() {
+             return "".to_owned();
+         } else if self.relay_servers.len() == 1 {
+             return self.relay_servers[0].clone();
+         }
+-        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
+-        self.relay_servers[i].clone()
++        // 多中继就近选择（补丁 v3）：按双方公网 IP 的国家/地区给中继分级，
++        // 同级内轮换。0=与任一端同国家，1=同大区（亚太/美洲/欧非中东），2=其他。
++        // 无定位信息时退化为全体轮换（与原版行为一致）。
++        let ca = geoip_country(pa);
++        let cb = geoip_country(pb);
++        let mut best: Vec<String> = Vec::new();
++        let mut best_tier = u8::MAX;
++        for relay in self.relay_servers.iter() {
++            let tier = match relay_country(relay) {
++                Some(cc) => {
++                    if Some(&cc) == ca.as_ref() || Some(&cc) == cb.as_ref() {
++                        0
++                    } else if region_of(&cc) == ca.as_deref().map(region_of).unwrap_or("")
++                        || region_of(&cc) == cb.as_deref().map(region_of).unwrap_or("")
++                    {
++                        1
++                    } else {
++                        2
++                    }
++                }
++                None => 2,
++            };
++            if tier < best_tier {
++                best_tier = tier;
++                best = vec![relay.clone()];
++            } else if tier == best_tier {
++                best.push(relay.clone());
++            }
++        }
++        let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % best.len();
++        let chosen = best[i].clone();
++        log::info!(
++            "relay select: peers {}({:?}) {}({:?}) -> {} (tier {})",
++            pa,
++            ca,
++            pb,
++            cb,
++            chosen,
++            best_tier
++        );
++        chosen
+     }
+ 
+     async fn check_cmd(&self, cmd: &str) -> String {
+@@ -1169,22 +1478,52 @@ impl RendezvousServer {
              let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
              let (a, mut b) = ws_stream.split();
              sink = Some(Sink::Ws(a));
