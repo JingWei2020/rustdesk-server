@@ -1,0 +1,15 @@
+[Unit]
+Description=RustDesk admin console 2FA gate (TOTP, for Nginx auth_request)
+After=network.target
+
+[Service]
+Type=simple
+Environment=GATE_STATE_DIR=/opt/rustdesk-gate
+Environment=GATE_LISTEN_HOST=127.0.0.1
+Environment=GATE_LISTEN_PORT=21215
+ExecStart=/usr/bin/python3 /opt/rustdesk-gate/admin_gate.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
