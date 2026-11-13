@@ -507,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
         <p>或使用口令 + 动态码登录：</p>{WA_JS}"""
         return page("控制台双因素验证", f"""
         <h1>RustDesk 控制台 · 双因素验证</h1>
-        <p>安全密钥登录通过后将直达控制台；口令 + 动态码通过后，还需再完成控制台自身的账号登录。</p>{e}{wa}
+        <p>验证通过后将直达控制台，不再输入控制台账号密码。</p>{e}{wa}
         <form method="post" action="/gate/login">
           <label>网关口令</label>
           <input type="password" name="password" autocomplete="current-password" required>
@@ -530,7 +530,8 @@ class Handler(BaseHTTPRequestHandler):
             st["totp_secret"], form.get("code", "")
         ):
             clear_fails(ip)
-            self._redirect("/_admin/", cookie=make_cookie(st))
+            target = "/gate/sso" if st.get("sso_user") else "/_admin/"
+            self._redirect(target, cookie=make_cookie(st))
         else:
             record_fail(ip)
             self._send(401, self._login_page("口令或动态码不正确。"))
@@ -926,7 +927,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path == "/gate/login":
+        if path == "/gate/logout":
+            self._send(204, "", extra={
+                "Set-Cookie": f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+            })
+        elif path == "/gate/login":
             self._login()
         elif path == "/gate/enroll":
             self._enroll()
