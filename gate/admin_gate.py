@@ -401,17 +401,23 @@ WA_JS = """
 function b64uToBuf(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var bin=atob(s);var b=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b.buffer;}
 function bufToB64u(buf){var b=new Uint8Array(buf);var s='';for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
 async function waPost(url, body){var r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return r.json();}
+var waLoginPending=false;
 async function waLoginStart(errEl){
+  if(waLoginPending)return;
+  waLoginPending=true;
+  var btn=document.getElementById('wa-login-btn');
+  if(btn){btn.disabled=true;btn.textContent='正在等待系统验证弹窗…请在弹窗中选通行密钥并确认';}
   try{
     var o=await waPost('/gate/webauthn/login/options');
     if(o.error)throw new Error(o.error);
     o.challenge=b64uToBuf(o.challenge);
+    o.timeout=120000;
     (o.allowCredentials||[]).forEach(function(c){c.id=b64uToBuf(c.id);});
     var cred=await navigator.credentials.get({publicKey:o});
     var j=await waPost('/gate/webauthn/login/verify',{id:cred.id,rawId:bufToB64u(cred.rawId),response:{authenticatorData:bufToB64u(cred.response.authenticatorData),clientDataJSON:bufToB64u(cred.response.clientDataJSON),signature:bufToB64u(cred.response.signature)}});
     if(!j.ok)throw new Error(j.error||'验证失败');
     location.href=j.redirect||'/_admin/';
-  }catch(e){ if(errEl)errEl.textContent='安全密钥登录失败：'+e.message; else alert('安全密钥登录失败：'+e.message); }
+  }catch(e){ waLoginPending=false; if(btn){btn.disabled=false;btn.textContent='用安全密钥登录（免口令）';} if(errEl)errEl.textContent='安全密钥登录失败：'+e.message; else alert('安全密钥登录失败：'+e.message); }
 }
 async function waRegisterStart(){
   var name=(document.getElementById('wa-name').value||'YubiKey').trim();
@@ -486,7 +492,7 @@ class Handler(BaseHTTPRequestHandler):
         wa = ""
         if wa_credentials(load_state()):
             wa = f"""
-        <button type="button" onclick="waLoginStart(document.getElementById('wa-err'))">用安全密钥登录（免口令）</button>
+        <button type="button" id="wa-login-btn" onclick="waLoginStart(document.getElementById('wa-err'))">用安全密钥登录（免口令）</button>
         <div class="err" id="wa-err"></div>
         <p>或使用口令 + 动态码登录：</p>{WA_JS}"""
         return page("控制台双因素验证", f"""
