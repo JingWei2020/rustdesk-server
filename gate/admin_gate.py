@@ -186,6 +186,40 @@ code{{color:#93c5fd;word-break:break-all;font-size:12px}}
 # 口令+TOTP 保留为兜底与恢复路径；可注册多把密钥（常用 + 备份）。
 WA_RP_ID = os.environ.get("GATE_RP_ID", "rd.ljwc.eu.cc")
 WA_ORIGIN = os.environ.get("GATE_ORIGIN", "https://rd.ljwc.eu.cc")
+# 安全密钥登录成功后直达后台（SSO）：网关用管理员在 /gate/security 里预存的
+# lejianwen 账号密码（存 state.json，root-only 600）向本地 API 换 token，
+# 再由 /gate/sso 页面把 token 写入控制台 SPA 的 localStorage 后跳入后台。
+SSO_API_BASE = os.environ.get("GATE_SSO_API_BASE", "http://127.0.0.1:21114")
+
+
+def _lejianwen_login(username: str, password: str):
+    """向 lejianwen /api/login 换 token，成功返回 data dict，失败抛 ValueError。"""
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        SSO_API_BASE + "/api/login",
+        data=json.dumps({"username": username, "password": password}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            out = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            raise ValueError(f"lejianwen login http {e.code}")
+    if out.get("error"):
+        raise ValueError(str(out["error"]))
+    data = out.get("data") or {}
+    if not data.get("token"):
+        raise ValueError("lejianwen login: no token in response")
+    return data
+
+
+def _sso_configured(st) -> bool:
+    return bool(st.get("sso_user") and st.get("sso_pass"))
 WA_USER_HANDLE = b"jingwei-rustdesk-gate"
 WA_CHALLENGES = {}  # challenge_b64u -> (purpose, expire_ts)
 
@@ -370,7 +404,7 @@ async function waLoginStart(errEl){
     var cred=await navigator.credentials.get({publicKey:o});
     var j=await waPost('/gate/webauthn/login/verify',{id:cred.id,rawId:bufToB64u(cred.rawId),response:{authenticatorData:bufToB64u(cred.response.authenticatorData),clientDataJSON:bufToB64u(cred.response.clientDataJSON),signature:bufToB64u(cred.response.signature)}});
     if(!j.ok)throw new Error(j.error||'验证失败');
-    location.href='/_admin/';
+    location.href=j.redirect||'/_admin/';
   }catch(e){ if(errEl)errEl.textContent='安全密钥登录失败：'+e.message; else alert('安全密钥登录失败：'+e.message); }
 }
 async function waRegisterStart(){
@@ -723,12 +757,59 @@ class Handler(BaseHTTPRequestHandler):
                 cred["sign_count"] = sc
                 save_state(st)
             clear_fails(ip)
-            self._send_json(200, {"ok": True}, cookie=make_cookie(st))
+            out = {"ok": True}
+            if _sso_configured(st):
+                out["redirect"] = "/gate/sso"
+            self._send_json(200, out, cookie=make_cookie(st))
         except Exception as e:
             record_fail(ip)
             self._wa_err(str(e))
 
-    def _security_page(self):
+    def _sso_page(self):
+        st = load_state()
+        if not _sso_configured(st):
+            self._redirect("/_admin/")
+            return
+        try:
+            data = _lejianwen_login(st["sso_user"], st["sso_pass"])
+        except Exception:
+            self._redirect("/_admin/")
+            return
+        token = json.dumps(data["token"])
+        uname = json.dumps(data.get("username") or st["sso_user"])
+        body = f"""<script>
+        localStorage.setItem('access_token', {token});
+        localStorage.setItem('wc-option:local:access_token', {token});
+        localStorage.setItem('user_info', JSON.stringify({{name: {uname}}}));
+        location.replace('/_admin/');
+        </script>"""
+        self._send(200, body)
+
+    def _sso_config(self):
+        if not self._gate_authed():
+            self._redirect("/gate/login")
+            return
+        form = self._form()
+        st = load_state()
+        if form.get("clear", "") == "1":
+            st.pop("sso_user", None)
+            st.pop("sso_pass", None)
+            save_state(st)
+            self._redirect("/gate/security")
+            return
+        user = form.get("sso_user", "").strip()
+        pw = form.get("sso_pass", "")
+        try:
+            _lejianwen_login(user, pw)
+        except Exception as e:
+            self._send(400, self._security_page(err=f"控制台账号验证失败：{e}"))
+            return
+        st["sso_user"] = user
+        st["sso_pass"] = pw
+        save_state(st)
+        self._redirect("/gate/security")
+
+    def _security_page(self, err=""):
         st = load_state()
         rows = ""
         for c in wa_credentials(st):
@@ -743,8 +824,29 @@ class Handler(BaseHTTPRequestHandler):
             )
         if not rows:
             rows = "<p>还没有安全密钥。添加一把后，登录页即可免口令一键登录。</p>"
+        e = f'<div class="err">{err}</div>' if err else ""
+        if _sso_configured(st):
+            sso = f"""
+        <p>已开启：安全密钥验证通过后自动登录控制台（账号 {st.get('sso_user')}），
+        不再输控制台账号密码。</p>
+        <form method="post" action="/gate/sso/config">
+          <input type="hidden" name="clear" value="1">
+          <button type="submit">关闭免登录直达</button>
+        </form>"""
+        else:
+            sso = """
+        <p>未开启。开启后：安全密钥验证通过即自动登录控制台，不再输控制台账号密码。
+        需在此填一次控制台管理员账号密码（网关会先向控制台验证，正确才保存；
+        密码明文存服务器 root 专用状态文件，与动态码密钥同级保护）。</p>
+        <form method="post" action="/gate/sso/config">
+          <label>控制台用户名</label>
+          <input type="text" name="sso_user" value="admin" autocomplete="username">
+          <label>控制台密码</label>
+          <input type="password" name="sso_pass" autocomplete="current-password">
+          <button type="submit">验证并开启免登录直达</button>
+        </form>"""
         body = f"""
-        <h1>安全密钥（免密码登录）</h1>
+        <h1>安全密钥（免密码登录）</h1>{e}
         <p>已添加的安全密钥：</p>{rows}
         <label>给新密钥起个名（如 YubiKey 5 NFC）</label>
         <input type="text" id="wa-name" value="YubiKey">
@@ -752,6 +854,7 @@ class Handler(BaseHTTPRequestHandler):
         <div class="err" id="wa-err"></div>
         <p>建议两把 YubiKey 都加上（一把常用、一把备份）。口令 + 动态码的
         登录方式会保留作兜底。添加时浏览器会要求触摸密钥。</p>
+        <h1>控制台免登录直达</h1>{sso}
         <p><a href="/_admin/">返回控制台</a> · <a href="/gate/client">定制客户端</a></p>
         {WA_JS}"""
         return page("安全密钥", body)
@@ -774,6 +877,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/gate/security":
             if self._gate_authed():
                 self._send(200, self._security_page())
+            else:
+                self._redirect("/gate/login")
+        elif path == "/gate/sso":
+            if self._gate_authed():
+                self._sso_page()
             else:
                 self._redirect("/gate/login")
         elif path == "/gate/login":
@@ -800,6 +908,8 @@ class Handler(BaseHTTPRequestHandler):
             self._login()
         elif path == "/gate/enroll":
             self._enroll()
+        elif path == "/gate/sso/config":
+            self._sso_config()
         elif path == "/gate/webauthn/register/options":
             self._wa_register_options()
         elif path == "/gate/webauthn/register/verify":
@@ -816,7 +926,7 @@ class Handler(BaseHTTPRequestHandler):
                 st = load_state()
                 st["webauthn"] = [
                     c for c in wa_credentials(st)
-                    if c["cred_id"] != data.get("cred_id", [""])[0]
+                    if c["cred_id"] != data.get("cred_id", "")
                 ]
                 save_state(st)
                 self._redirect("/gate/security")
