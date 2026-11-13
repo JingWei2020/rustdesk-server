@@ -179,6 +179,217 @@ code{{color:#93c5fd;word-break:break-all;font-size:12px}}
 </style></head><body><div class="card">{body}</div></body></html>"""
 
 
+# ================= WebAuthn（YubiKey 等安全密钥免密码登录） =================
+# 在口令+TOTP 之外增加 FIDO2/WebAuthn 登录：注册必须在已通过网关验证的会话里
+# 完成（因此不校验 attestation 证书链，只解析 authData 取凭据公钥）；
+# 登录断言则严格验签（cryptography 库，DC-02 随 certbot 已装 python3-cryptography）。
+# 口令+TOTP 保留为兜底与恢复路径；可注册多把密钥（常用 + 备份）。
+WA_RP_ID = os.environ.get("GATE_RP_ID", "rd.ljwc.eu.cc")
+WA_ORIGIN = os.environ.get("GATE_ORIGIN", "https://rd.ljwc.eu.cc")
+WA_USER_HANDLE = b"jingwei-rustdesk-gate"
+WA_CHALLENGES = {}  # challenge_b64u -> (purpose, expire_ts)
+
+
+def b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def b64u_dec(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _cbor_read(data, off):
+    """极简 CBOR 解码（WebAuthn 用到的主类型 0-5 与简单值），返回 (对象, 新偏移)。"""
+    b0 = data[off]
+    off += 1
+    major, ai = b0 >> 5, b0 & 0x1F
+    if ai < 24:
+        n = ai
+    elif ai == 24:
+        n = data[off]
+        off += 1
+    elif ai == 25:
+        n = struct.unpack(">H", data[off:off + 2])[0]
+        off += 2
+    elif ai == 26:
+        n = struct.unpack(">I", data[off:off + 4])[0]
+        off += 4
+    elif ai == 27:
+        n = struct.unpack(">Q", data[off:off + 8])[0]
+        off += 8
+    else:
+        raise ValueError("cbor: unsupported additional info")
+    if major == 0:
+        return n, off
+    if major == 1:
+        return -1 - n, off
+    if major == 2:
+        return data[off:off + n], off + n
+    if major == 3:
+        return data[off:off + n].decode("utf-8"), off + n
+    if major == 4:
+        arr = []
+        for _ in range(n):
+            v, off = _cbor_read(data, off)
+            arr.append(v)
+        return arr, off
+    if major == 5:
+        m = {}
+        for _ in range(n):
+            k, off = _cbor_read(data, off)
+            v, off = _cbor_read(data, off)
+            m[k] = v
+        return m, off
+    if major == 7:
+        if ai == 20:
+            return False, off
+        if ai == 21:
+            return True, off
+        if ai == 22:
+            return None, off
+        raise ValueError("cbor: unsupported simple value")
+    raise ValueError("cbor: bad major type")
+
+
+def _parse_auth_data(auth: bytes, with_attested: bool):
+    if len(auth) < 37:
+        raise ValueError("authData too short")
+    out = {
+        "rp_id_hash": auth[:32],
+        "flags": auth[32],
+        "sign_count": struct.unpack(">I", auth[33:37])[0],
+    }
+    if with_attested:
+        off = 37 + 16  # 跳过 AAGUID
+        clen = struct.unpack(">H", auth[off:off + 2])[0]
+        off += 2
+        out["cred_id"] = auth[off:off + clen]
+        off += clen
+        cose, _ = _cbor_read(auth, off)
+        out["cose"] = cose
+    return out
+
+
+def _numbers_to_pubkey(numbers):
+    # cryptography 2.8（DC-02 系统版）要求传 backend，新版又移除了该参数，两边都兼容
+    try:
+        return numbers.public_key()
+    except TypeError:
+        from cryptography.hazmat.backends import default_backend
+        return numbers.public_key(default_backend())
+
+
+def _load_pem_key(pem: str):
+    from cryptography.hazmat.primitives import serialization
+    try:
+        return serialization.load_pem_public_key(pem.encode())
+    except TypeError:
+        from cryptography.hazmat.backends import default_backend
+        return serialization.load_pem_public_key(pem.encode(), backend=default_backend())
+
+
+def _cose_to_pem(cose) -> str:
+    from cryptography.hazmat.primitives import serialization
+    kty = cose.get(1)
+    if kty == 2:  # EC2
+        from cryptography.hazmat.primitives.asymmetric import ec
+        x = int.from_bytes(cose[-2], "big")
+        y = int.from_bytes(cose[-3], "big")
+        key = _numbers_to_pubkey(ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()))
+    elif kty == 1:  # OKP (Ed25519)
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        key = Ed25519PublicKey.from_public_bytes(cose[-2])
+    elif kty == 3:  # RSA
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        n = int.from_bytes(cose[-1], "big")
+        e = int.from_bytes(cose[-2], "big")
+        key = _numbers_to_pubkey(rsa.RSAPublicNumbers(e, n))
+    else:
+        raise ValueError("unsupported COSE kty")
+    return key.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+
+
+def _verify_assertion(pem: str, alg: int, signature: bytes, data: bytes):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, padding
+    from cryptography.exceptions import InvalidSignature
+    key = _load_pem_key(pem)
+    try:
+        if alg == -8:  # EdDSA
+            key.verify(signature, data)
+        elif alg == -257:  # RS256
+            key.verify(signature, data, padding.PKCS1v15(), hashes.SHA256())
+        else:  # ES256 (-7) 及其它 EC 算法按 ES256 处理
+            key.verify(signature, data, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise ValueError("signature verification failed")
+
+
+def _wa_issue_challenge(purpose: str) -> str:
+    chal = b64u(secrets.token_bytes(32))
+    now = time.time()
+    for k in [k for k, (_, exp) in WA_CHALLENGES.items() if exp < now]:
+        WA_CHALLENGES.pop(k, None)
+    WA_CHALLENGES[chal] = (purpose, now + 180)
+    return chal
+
+
+def _wa_consume_challenge(chal: str, purpose: str):
+    item = WA_CHALLENGES.pop(chal, None)
+    if not item or item[0] != purpose or item[1] < time.time():
+        raise ValueError("challenge invalid or expired")
+
+
+def _wa_check_client_data(raw: bytes, expect_type: str, purpose: str):
+    cd = json.loads(raw.decode("utf-8"))
+    if cd.get("type") != expect_type:
+        raise ValueError("clientData type mismatch")
+    if cd.get("origin") != WA_ORIGIN:
+        raise ValueError("origin mismatch")
+    _wa_consume_challenge(cd.get("challenge", ""), purpose)
+    return cd
+
+
+def wa_credentials(st):
+    return st.get("webauthn") or []
+
+
+WA_JS = """
+<script>
+function b64uToBuf(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var bin=atob(s);var b=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b.buffer;}
+function bufToB64u(buf){var b=new Uint8Array(buf);var s='';for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
+async function waPost(url, body){var r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return r.json();}
+async function waLoginStart(errEl){
+  try{
+    var o=await waPost('/gate/webauthn/login/options');
+    if(o.error)throw new Error(o.error);
+    o.challenge=b64uToBuf(o.challenge);
+    (o.allowCredentials||[]).forEach(function(c){c.id=b64uToBuf(c.id);});
+    var cred=await navigator.credentials.get({publicKey:o});
+    var j=await waPost('/gate/webauthn/login/verify',{id:cred.id,rawId:bufToB64u(cred.rawId),response:{authenticatorData:bufToB64u(cred.response.authenticatorData),clientDataJSON:bufToB64u(cred.response.clientDataJSON),signature:bufToB64u(cred.response.signature)}});
+    if(!j.ok)throw new Error(j.error||'验证失败');
+    location.href='/_admin/';
+  }catch(e){ if(errEl)errEl.textContent='安全密钥登录失败：'+e.message; else alert('安全密钥登录失败：'+e.message); }
+}
+async function waRegisterStart(){
+  var name=(document.getElementById('wa-name').value||'YubiKey').trim();
+  var errEl=document.getElementById('wa-err');
+  try{
+    var o=await waPost('/gate/webauthn/register/options');
+    if(o.error)throw new Error(o.error);
+    o.challenge=b64uToBuf(o.challenge); o.user.id=b64uToBuf(o.user.id);
+    (o.excludeCredentials||[]).forEach(function(c){c.id=b64uToBuf(c.id);});
+    var cred=await navigator.credentials.create({publicKey:o});
+    var j=await waPost('/gate/webauthn/register/verify',{id:cred.id,rawId:bufToB64u(cred.rawId),name:name,response:{attestationObject:bufToB64u(cred.response.attestationObject),clientDataJSON:bufToB64u(cred.response.clientDataJSON)}});
+    if(!j.ok)throw new Error(j.error||'注册失败');
+    location.reload();
+  }catch(e){ if(errEl)errEl.textContent='添加失败：'+e.message; }
+}
+</script>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -232,9 +443,15 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 登录 ----------
     def _login_page(self, err=""):
         e = f'<div class="err">{err}</div>' if err else ""
+        wa = ""
+        if wa_credentials(load_state()):
+            wa = f"""
+        <button type="button" onclick="waLoginStart(document.getElementById('wa-err'))">用安全密钥登录（免口令）</button>
+        <div class="err" id="wa-err"></div>
+        <p>或使用口令 + 动态码登录：</p>{WA_JS}"""
         return page("控制台双因素验证", f"""
         <h1>RustDesk 控制台 · 双因素验证</h1>
-        <p>通过本网关后，还需再完成控制台自身的账号登录。</p>{e}
+        <p>通过本网关后，还需再完成控制台自身的账号登录。</p>{e}{wa}
         <form method="post" action="/gate/login">
           <label>网关口令</label>
           <input type="password" name="password" autocomplete="current-password" required>
@@ -378,6 +595,167 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    # ---------- WebAuthn（安全密钥免密码登录） ----------
+    def _json_body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+        except Exception:
+            return {}
+
+    def _send_json(self, code, obj, cookie=None):
+        extra = {}
+        if cookie:
+            extra["Set-Cookie"] = (
+                f"{COOKIE_NAME}={cookie}; Path=/; Max-Age={COOKIE_TTL}; "
+                "HttpOnly; Secure; SameSite=Lax"
+            )
+        self._send(code, json.dumps(obj), "application/json", extra=extra)
+
+    def _wa_err(self, msg, code=400):
+        self._send_json(code, {"ok": False, "error": msg})
+
+    def _wa_register_options(self):
+        if not self._gate_authed():
+            return self._wa_err("not authenticated", 401)
+        st = load_state()
+        opts = {
+            "challenge": _wa_issue_challenge("register"),
+            "rp": {"id": WA_RP_ID, "name": "RustDesk Console"},
+            "user": {
+                "id": b64u(WA_USER_HANDLE),
+                "name": "jingwei",
+                "displayName": "JingWei",
+            },
+            "pubKeyCredParams": [
+                {"type": "public-key", "alg": -7},
+                {"type": "public-key", "alg": -8},
+                {"type": "public-key", "alg": -257},
+            ],
+            "authenticatorSelection": {
+                # 不限制 authenticatorAttachment：手机本机通行密钥与
+                # USB/NFC 安全密钥（YubiKey）都可注册，登录时任选其一
+                "residentKey": "preferred",
+                "userVerification": "preferred",
+            },
+            "attestation": "none",
+            "excludeCredentials": [
+                {"type": "public-key", "id": c["cred_id"]} for c in wa_credentials(st)
+            ],
+            "timeout": 60000,
+        }
+        self._send_json(200, opts)
+
+    def _wa_register_verify(self):
+        if not self._gate_authed():
+            return self._wa_err("not authenticated", 401)
+        try:
+            body = self._json_body()
+            resp = body["response"]
+            _wa_check_client_data(b64u_dec(resp["clientDataJSON"]), "webauthn.create", "register")
+            att, _ = _cbor_read(b64u_dec(resp["attestationObject"]), 0)
+            auth = _parse_auth_data(att["authData"], True)
+            if auth["rp_id_hash"] != hashlib.sha256(WA_RP_ID.encode()).digest():
+                raise ValueError("rpIdHash mismatch")
+            if not (auth["flags"] & 0x01):
+                raise ValueError("user presence flag missing")
+            cose = auth["cose"]
+            entry = {
+                "cred_id": b64u(auth["cred_id"]),
+                "pem": _cose_to_pem(cose),
+                "alg": cose.get(3, -7),
+                "sign_count": auth["sign_count"],
+                "name": (body.get("name") or "YubiKey")[:40],
+                "created": int(time.time()),
+            }
+            st = load_state()
+            creds = [c for c in wa_credentials(st) if c["cred_id"] != entry["cred_id"]]
+            creds.append(entry)
+            st["webauthn"] = creds
+            save_state(st)
+            self._send_json(200, {"ok": True})
+        except Exception as e:
+            self._wa_err(str(e))
+
+    def _wa_login_options(self):
+        st = load_state()
+        creds = wa_credentials(st)
+        if not creds:
+            return self._wa_err("no security key registered")
+        self._send_json(200, {
+            "challenge": _wa_issue_challenge("login"),
+            "rpId": WA_RP_ID,
+            "allowCredentials": [
+                {"type": "public-key", "id": c["cred_id"]} for c in creds
+            ],
+            "userVerification": "preferred",
+            "timeout": 60000,
+        })
+
+    def _wa_login_verify(self):
+        ip = self._ip()
+        if rate_limited(ip):
+            return self._wa_err("too many attempts", 429)
+        try:
+            body = self._json_body()
+            resp = body["response"]
+            st = load_state()
+            cred = None
+            for c in wa_credentials(st):
+                if c["cred_id"] in (body.get("id"), body.get("rawId")):
+                    cred = c
+                    break
+            if cred is None:
+                raise ValueError("unknown credential")
+            auth = _parse_auth_data(b64u_dec(resp["authenticatorData"]), False)
+            if auth["rp_id_hash"] != hashlib.sha256(WA_RP_ID.encode()).digest():
+                raise ValueError("rpIdHash mismatch")
+            if not (auth["flags"] & 0x01):
+                raise ValueError("user presence flag missing")
+            cd_raw = b64u_dec(resp["clientDataJSON"])
+            _wa_check_client_data(cd_raw, "webauthn.get", "login")
+            signed = b64u_dec(resp["authenticatorData"]) + hashlib.sha256(cd_raw).digest()
+            _verify_assertion(cred["pem"], cred.get("alg", -7), b64u_dec(resp["signature"]), signed)
+            sc = auth["sign_count"]
+            if sc and cred.get("sign_count") and sc <= cred["sign_count"]:
+                raise ValueError("sign count regression")
+            if sc:
+                cred["sign_count"] = sc
+                save_state(st)
+            clear_fails(ip)
+            self._send_json(200, {"ok": True}, cookie=make_cookie(st))
+        except Exception as e:
+            record_fail(ip)
+            self._wa_err(str(e))
+
+    def _security_page(self):
+        st = load_state()
+        rows = ""
+        for c in wa_credentials(st):
+            from datetime import datetime
+            when = datetime.fromtimestamp(c.get("created", 0)).strftime("%Y-%m-%d %H:%M")
+            rows += (
+                f'<div class="secret">{c.get("name", "YubiKey")} · 添加于 {when}'
+                f'<form method="post" action="/gate/webauthn/delete" '
+                f'onsubmit="return confirm(\'删除这把安全密钥？\')">'
+                f'<input type="hidden" name="cred_id" value="{c["cred_id"]}">'
+                f'<button type="submit">删除</button></form></div>'
+            )
+        if not rows:
+            rows = "<p>还没有安全密钥。添加一把后，登录页即可免口令一键登录。</p>"
+        body = f"""
+        <h1>安全密钥（免密码登录）</h1>
+        <p>已添加的安全密钥：</p>{rows}
+        <label>给新密钥起个名（如 YubiKey 5 NFC）</label>
+        <input type="text" id="wa-name" value="YubiKey">
+        <button type="button" onclick="waRegisterStart()">添加安全密钥</button>
+        <div class="err" id="wa-err"></div>
+        <p>建议两把 YubiKey 都加上（一把常用、一把备份）。口令 + 动态码的
+        登录方式会保留作兜底。添加时浏览器会要求触摸密钥。</p>
+        <p><a href="/_admin/">返回控制台</a> · <a href="/gate/client">定制客户端</a></p>
+        {WA_JS}"""
+        return page("安全密钥", body)
+
     # ---------- 路由 ----------
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -391,6 +769,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/gate/client/download":
             if self._gate_authed():
                 self._client_download()
+            else:
+                self._redirect("/gate/login")
+        elif path == "/gate/security":
+            if self._gate_authed():
+                self._send(200, self._security_page())
             else:
                 self._redirect("/gate/login")
         elif path == "/gate/login":
@@ -417,6 +800,26 @@ class Handler(BaseHTTPRequestHandler):
             self._login()
         elif path == "/gate/enroll":
             self._enroll()
+        elif path == "/gate/webauthn/register/options":
+            self._wa_register_options()
+        elif path == "/gate/webauthn/register/verify":
+            self._wa_register_verify()
+        elif path == "/gate/webauthn/login/options":
+            self._wa_login_options()
+        elif path == "/gate/webauthn/login/verify":
+            self._wa_login_verify()
+        elif path == "/gate/webauthn/delete":
+            if not self._gate_authed():
+                self._redirect("/gate/login")
+            else:
+                data = self._form()
+                st = load_state()
+                st["webauthn"] = [
+                    c for c in wa_credentials(st)
+                    if c["cred_id"] != data.get("cred_id", [""])[0]
+                ]
+                save_state(st)
+                self._redirect("/gate/security")
         else:
             self._send(404, "not found", "text/plain")
 
