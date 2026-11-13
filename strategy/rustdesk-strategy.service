@@ -1,0 +1,13 @@
+[Unit]
+Description=RustDesk strategy service (open-source Pro strategy replacement)
+After=network.target rustdesk-api.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/rustdesk-strategy/env
+ExecStart=/usr/bin/python3 /opt/rustdesk-strategy/strategy_service.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

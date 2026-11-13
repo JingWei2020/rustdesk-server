@@ -14,7 +14,7 @@
 | 3 | Web 管理控制台（设备/用户管理） | ✅ | lejianwen Web Admin：用户、设备、地址簿、标签、群组、OAuth、LDAP 配置与日志管理齐全 |
 | 4 | 用户组 / 设备组与按组访问控制 | ◐ | lejianwen 有共享组/普通组与地址簿共享；与 Pro 按组做设备授权的粒度差待补 |
 | 5 | 连接 / 文件传输审计日志 | ✅ | lejianwen 有登录日志、链接日志、文件传输日志 |
-| 6 | 安全设置同步 / 策略下发 | ⏳ | lejianwen 无此功能，待实现（API 层新增策略模型 + 客户端拉取接口） |
+| 6 | 安全设置同步 / 策略下发 | ✅ | 独立策略服务（本仓库 strategy/）：客户端心跳 /api/heartbeat 协议与 Pro 完全一致（源码依据为开源客户端 src/hbbs_http/sync.rs），管理 API 对齐官方 res/strategies.py（CRUD/启停/按设备分配）；2026-11-13 部署 DC-02 并实机验证：给 win11 下发 disable-audio 后客户端日志 `strategy updated`、配置落盘，撤销后自动清除。用户/组分配的解析待 #4 一并补强 |
 | 7 | 控制台双因素认证（2FA） | ⏳ | lejianwen 无，待实现（TOTP） |
 | 8 | OIDC / LDAP 单点登录 | ✅ | lejianwen 支持 GitHub / Google / OIDC 授权登录与 LDAP（AD、OpenLDAP），部署时配置即可 |
 | 9 | API 令牌（细粒度权限） | ⏳ | lejianwen 有 JWT 与令牌有效期管理；Pro 式按权限划分的 API 令牌待补 |
