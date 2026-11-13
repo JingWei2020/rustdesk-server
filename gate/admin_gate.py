@@ -372,7 +372,7 @@ def _wa_issue_challenge(purpose: str) -> str:
     now = time.time()
     for k in [k for k, (_, exp) in WA_CHALLENGES.items() if exp < now]:
         WA_CHALLENGES.pop(k, None)
-    WA_CHALLENGES[chal] = (purpose, now + 180)
+    WA_CHALLENGES[chal] = (purpose, now + 300)
     return chal
 
 
@@ -402,17 +402,26 @@ function b64uToBuf(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s
 function bufToB64u(buf){var b=new Uint8Array(buf);var s='';for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
 async function waPost(url, body){var r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return r.json();}
 var waLoginPending=false;
+var waStash=null, waStashAt=0;
+async function waPrefetch(){
+  try{
+    var o=await waPost('/gate/webauthn/login/options');
+    if(!o.error){ waStash=o; waStashAt=Date.now(); }
+  }catch(e){}
+}
 async function waLoginStart(errEl){
   if(waLoginPending)return;
   waLoginPending=true;
   var btn=document.getElementById('wa-login-btn');
   if(btn){btn.disabled=true;btn.textContent='正在等待系统验证弹窗…请在弹窗中选通行密钥并确认';}
   try{
-    var o=await waPost('/gate/webauthn/login/options');
-    if(o.error)throw new Error(o.error);
-    o.challenge=b64uToBuf(o.challenge);
-    o.timeout=120000;
-    (o.allowCredentials||[]).forEach(function(c){c.id=b64uToBuf(c.id);});
+    var raw;
+    if(waStash && Date.now()-waStashAt < 240000){ raw=waStash; waStash=null; waPrefetch(); }
+    else { raw=await waPost('/gate/webauthn/login/options'); }
+    if(raw.error)throw new Error(raw.error);
+    var o={challenge:b64uToBuf(raw.challenge), rpId:raw.rpId, timeout:120000,
+           userVerification:raw.userVerification||'preferred',
+           allowCredentials:(raw.allowCredentials||[]).map(function(c){return {type:'public-key', id:b64uToBuf(c.id)};})};
     var cred=await navigator.credentials.get({publicKey:o});
     var j=await waPost('/gate/webauthn/login/verify',{id:cred.id,rawId:bufToB64u(cred.rawId),response:{authenticatorData:bufToB64u(cred.response.authenticatorData),clientDataJSON:bufToB64u(cred.response.clientDataJSON),signature:bufToB64u(cred.response.signature)}});
     if(!j.ok)throw new Error(j.error||'验证失败');
@@ -433,6 +442,7 @@ async function waRegisterStart(){
     location.reload();
   }catch(e){ if(errEl)errEl.textContent='添加失败：'+e.message; }
 }
+if(document.getElementById('wa-login-btn')){ waPrefetch(); setInterval(function(){ if(!waLoginPending) waPrefetch(); }, 120000); }
 </script>"""
 
 
