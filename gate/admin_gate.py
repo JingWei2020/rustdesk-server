@@ -193,11 +193,14 @@ SSO_API_BASE = os.environ.get("GATE_SSO_API_BASE", "http://127.0.0.1:21114")
 
 
 def _lejianwen_login(username: str, password: str):
-    """向 lejianwen /api/login 换 token，成功返回 data dict，失败抛 ValueError。"""
+    """向 lejianwen 管理端登录口 /api/admin/login 换 token（控制台 SPA 同款），
+    成功返回 data dict，失败抛 ValueError。
+    注意不要用 /api/login：那是客户端登录口，成功返回的是顶层 access_token
+    且形状不同——曾因此把正确密码的成功响应误判为失败。"""
     import urllib.request
     import urllib.error
     req = urllib.request.Request(
-        SSO_API_BASE + "/api/login",
+        SSO_API_BASE + "/api/admin/login",
         data=json.dumps({"username": username, "password": password}).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -210,12 +213,15 @@ def _lejianwen_login(username: str, password: str):
             out = json.loads(e.read().decode("utf-8"))
         except Exception:
             raise ValueError(f"lejianwen login http {e.code}")
-    if out.get("error"):
-        raise ValueError(str(out["error"]))
     data = out.get("data") or {}
-    if not data.get("token"):
-        raise ValueError("lejianwen login: no token in response")
-    return data
+    if data.get("token"):
+        return data
+    if out.get("access_token"):
+        return {"token": out["access_token"], "username": username}
+    msg = out.get("error") or out.get("message") or out.get("msg")
+    if msg:
+        raise ValueError(str(msg))
+    raise ValueError(f"lejianwen login: unexpected response code={out.get('code')}")
 
 
 def _sso_configured(st) -> bool:
