@@ -110,6 +110,18 @@ def init_db():
             last_used_at INTEGER NOT NULL DEFAULT 0,
             revoked INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS group_meta (
+            guid TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            allowed_incomings TEXT NOT NULL DEFAULT '[]',
+            allowed_outgoings TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE IF NOT EXISTS device_group_members (
+            group_guid TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            PRIMARY KEY (group_guid, device_id)
+        );
         """
     )
     conn.commit()
@@ -155,6 +167,140 @@ def find_assigned_strategy(conn, device_id):
     return strategy_row_to_obj(row) if row else None
 
 
+def device_context(device_id):
+    """从 lejianwen 库解析设备归属：所有者用户名、所有者所在用户组名、设备所在组名集合。"""
+    ctx = {"owner": "", "owner_group": "", "device_groups": set()}
+    try:
+        conn = lw_db()
+        try:
+            groups = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM groups")}
+            dgroups = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM device_groups")}
+            row = conn.execute(
+                "SELECT user_id, group_id FROM peers WHERE id=?", (device_id,)
+            ).fetchone()
+            if row:
+                user_id, peer_gid = row
+                if peer_gid:
+                    if peer_gid in groups:
+                        ctx["device_groups"].add(groups[peer_gid])
+                    if peer_gid in dgroups:
+                        ctx["device_groups"].add(dgroups[peer_gid])
+                u = conn.execute(
+                    "SELECT username, group_id FROM users WHERE id=?", (user_id,)
+                ).fetchone()
+                if u:
+                    ctx["owner"] = u[0] or ""
+                    ctx["owner_group"] = groups.get(u[1], "")
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    try:
+        conn = db()
+        try:
+            rows = conn.execute(
+                "SELECT group_guid FROM device_group_members WHERE device_id=?",
+                (device_id,),
+            ).fetchall()
+            # group_guid 存的是 GUID，反查组名需经 lejianwen 两表的名字→GUID 映射
+            name_by_guid = {}
+            try:
+                lc = lw_db()
+                try:
+                    for gid, name in lc.execute("SELECT id, name FROM device_groups"):
+                        name_by_guid[guid_for("device_group", name)] = name
+                    for gid, name in lc.execute("SELECT id, name FROM groups"):
+                        name_by_guid[guid_for("user_group", name)] = name
+                finally:
+                    lc.close()
+            except Exception:
+                pass
+            for r in rows:
+                if r[0] in name_by_guid:
+                    ctx["device_groups"].add(name_by_guid[r[0]])
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return ctx
+
+
+def _canonical_targets():
+    """把用户/组的 名字 与 GUID 两种写法互相关联，返回
+    {kind: {alias: {"canonical": guid, "aliases": {全部别名}}}}。
+    分配与取消分配都先经此规范化，避免按 GUID 分配、按名字取消时删不掉。"""
+    out = {"user": {}, "group": {}}
+    try:
+        conn = lw_db()
+        try:
+            for (name,) in conn.execute("SELECT username FROM users"):
+                g = guid_for("user", name)
+                info = {"canonical": g, "aliases": {name, g}}
+                out["user"][name] = info
+                out["user"][g] = info
+            ugroups = [r[0] for r in conn.execute("SELECT name FROM groups")]
+            dgroups = [r[0] for r in conn.execute("SELECT name FROM device_groups")]
+            for name in ugroups:
+                g = guid_for("user_group", name)
+                info = {"canonical": g, "aliases": {name, g, guid_for("device_group", name)}}
+                out["group"][name] = info
+                out["group"][g] = info
+            for name in dgroups:
+                if name in out["group"]:
+                    continue
+                g = guid_for("device_group", name)
+                info = {"canonical": g, "aliases": {name, g, guid_for("user_group", name)}}
+                out["group"][name] = info
+                out["group"][g] = info
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return out
+
+
+def resolve_strategy(conn, device_id):
+    """策略分配解析：peer 直配 > 按所有者用户 > 按组（所有者组/设备组），同级取最新修改。"""
+    ctx = device_context(device_id)
+    user_targets = set()
+    if ctx["owner"]:
+        user_targets = {ctx["owner"], guid_for("user", ctx["owner"])}
+    group_names = set(ctx["device_groups"])
+    if ctx["owner_group"]:
+        group_names.add(ctx["owner_group"])
+    group_targets = set(group_names)
+    for n in group_names:
+        group_targets.add(guid_for("user_group", n))
+        group_targets.add(guid_for("device_group", n))
+
+    rows = conn.execute(
+        """
+        SELECT s.guid, s.modified_at, a.kind, a.target FROM strategies s
+        JOIN assignments a ON a.strategy_guid = s.guid
+        WHERE s.enabled=1
+        """
+    ).fetchall()
+    best = None
+    best_key = None
+    for guid, modified_at, kind, target in rows:
+        if kind == "peer" and target == device_id:
+            prio = 0
+        elif kind == "user" and target in user_targets:
+            prio = 1
+        elif kind == "group" and target in group_targets:
+            prio = 2
+        else:
+            continue
+        key = (prio, -int(modified_at))
+        if best_key is None or key < best_key:
+            best_key = key
+            best = guid
+    if not best:
+        return None
+    row = conn.execute("SELECT * FROM strategies WHERE guid=?", (best,)).fetchone()
+    return strategy_row_to_obj(row) if row else None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -175,6 +321,16 @@ class Handler(BaseHTTPRequestHandler):
     def _read_body(self):
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n > 0 else b""
+
+    def _guard_json(self, raw):
+        if raw:
+            try:
+                json.loads(raw.decode("utf-8"))
+                return True
+            except Exception:
+                self._send_json(400, {"error": "invalid json"})
+                return False
+        return True
 
     def _query(self):
         return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -281,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
         if device_id:
             conn = db()
             try:
-                strat = find_assigned_strategy(conn, device_id)
+                strat = resolve_strategy(conn, device_id)
                 state = conn.execute(
                     "SELECT * FROM device_state WHERE device_id=?", (device_id,)
                 ).fetchone()
@@ -364,16 +520,21 @@ class Handler(BaseHTTPRequestHandler):
                         self._send_json(404, {"error": "strategy not found"})
                         return
                     sguid = row["guid"]
+                canon = _canonical_targets()
                 for kind, key in (("peer", "peers"), ("user", "users"), ("group", "groups")):
                     for target in data.get(key) or []:
                         target = str(target)
-                        conn.execute(
-                            "DELETE FROM assignments WHERE kind=? AND target=?", (kind, target)
-                        )
+                        info = canon.get(kind, {}).get(target)
+                        variants = {target} | (info["aliases"] if info else set())
+                        for v in variants:
+                            conn.execute(
+                                "DELETE FROM assignments WHERE kind=? AND target=?", (kind, v)
+                            )
                         if sguid:
+                            canonical = info["canonical"] if info else target
                             conn.execute(
                                 "INSERT INTO assignments(strategy_guid,kind,target) VALUES(?,?,?)",
-                                (sguid, kind, target),
+                                (sguid, kind, canonical),
                             )
                 conn.commit()
                 self._send_json(200, {"ok": True})
@@ -607,6 +768,11 @@ class Handler(BaseHTTPRequestHandler):
                 obj = {"guid": guid_for(kind, r[1]), "name": r[1]}
                 if with_type:
                     obj["type"] = r[2]
+                meta = self._meta(obj["guid"])
+                obj["note"] = meta["note"]
+                obj["allowed_incomings"] = meta["allowed_incomings"]
+                if kind == "user_group":
+                    obj["allowed_outgoings"] = meta["allowed_outgoings"]
                 if q.get("name") and not _like(str(r[1]), q["name"][0]):
                     continue
                 items.append(obj)
@@ -641,16 +807,300 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    # ---------- 分组与访问规则（Pro user-groups / device-groups） ----------
+    def _lw_write(self):
+        return sqlite3.connect(LEJIANWEN_DB)
+
+    def _meta(self, guid):
+        conn = db()
+        try:
+            r = conn.execute(
+                "SELECT note, allowed_incomings, allowed_outgoings FROM group_meta WHERE guid=?",
+                (guid,),
+            ).fetchone()
+            if not r:
+                return {"note": "", "allowed_incomings": [], "allowed_outgoings": []}
+            return {
+                "note": r[0],
+                "allowed_incomings": json.loads(r[1] or "[]"),
+                "allowed_outgoings": json.loads(r[2] or "[]"),
+            }
+        finally:
+            conn.close()
+
+    def _meta_set(self, guid, kind, note=None, inc=None, out=None):
+        cur = self._meta(guid)
+        conn = db()
+        try:
+            conn.execute(
+                "INSERT INTO group_meta(guid,kind,note,allowed_incomings,allowed_outgoings) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(guid) DO UPDATE SET note=excluded.note, "
+                "allowed_incomings=excluded.allowed_incomings, allowed_outgoings=excluded.allowed_outgoings",
+                (
+                    guid, kind,
+                    cur["note"] if note is None else note,
+                    json.dumps(cur["allowed_incomings"] if inc is None else inc),
+                    json.dumps(cur["allowed_outgoings"] if out is None else out),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _find_group(self, kind, guid):
+        table = "groups" if kind == "user_group" else "device_groups"
+        conn = self._lw()
+        if not conn:
+            return None
+        try:
+            for gid, name in conn.execute(f"SELECT id, name FROM {table}"):
+                if guid_for(kind, name) == guid:
+                    return (gid, name)
+            return None
+        finally:
+            conn.close()
+
+    def _group_obj(self, kind, name):
+        guid = guid_for(kind, name)
+        meta = self._meta(guid)
+        obj = {"guid": guid, "name": name, "note": meta["note"],
+               "allowed_incomings": meta["allowed_incomings"]}
+        if kind == "user_group":
+            obj["allowed_outgoings"] = meta["allowed_outgoings"]
+        return obj
+
+    def _group_create(self, kind, raw):
+        perm = "user_groups.edit" if kind == "user_group" else "device_groups.edit"
+        if not self._require(perm):
+            return
+        data = json.loads(raw.decode("utf-8") or "{}")
+        name = (data.get("name") or "").strip()
+        if not name:
+            self._send_json(400, {"error": "name required"})
+            return
+        table = "groups" if kind == "user_group" else "device_groups"
+        now_s = datetime.now(timezone.utc).astimezone().isoformat()
+        conn = self._lw_write()
+        try:
+            if conn.execute(f"SELECT 1 FROM {table} WHERE name=?", (name,)).fetchone():
+                self._send_json(409, {"error": "group name exists"})
+                return
+            if kind == "user_group":
+                conn.execute(
+                    "INSERT INTO groups(name,type,created_at,updated_at) VALUES(?,1,?,?)",
+                    (name, now_s, now_s),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO device_groups(name,created_at,updated_at) VALUES(?,?,?)",
+                    (name, now_s, now_s),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self._meta_set(
+            guid_for(kind, name), kind,
+            note=data.get("note", ""),
+            inc=data.get("allowed_incomings"),
+            out=data.get("allowed_outgoings") if kind == "user_group" else None,
+        )
+        self._send_json(200, self._group_obj(kind, name))
+
+    def _group_update(self, kind, guid, raw):
+        perm = "user_groups.edit" if kind == "user_group" else "device_groups.edit"
+        if not self._require(perm):
+            return
+        found = self._find_group(kind, guid)
+        if not found:
+            self._send_json(404, {"error": "group not found"})
+            return
+        gid, name = found
+        data = json.loads(raw.decode("utf-8") or "{}")
+        new_name = (data.get("name") or name).strip()
+        table = "groups" if kind == "user_group" else "device_groups"
+        if new_name != name:
+            conn = self._lw_write()
+            try:
+                conn.execute(f"UPDATE {table} SET name=? WHERE id=?", (new_name, gid))
+                conn.commit()
+            finally:
+                conn.close()
+            # GUID 由组名派生：把 meta 迁移到新 GUID
+            old_meta = self._meta(guid)
+            conn = db()
+            try:
+                conn.execute("DELETE FROM group_meta WHERE guid=?", (guid,))
+                conn.execute(
+                    "UPDATE device_group_members SET group_guid=? WHERE group_guid=?",
+                    (guid_for(kind, new_name), guid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self._meta_set(guid_for(kind, new_name), kind, note=old_meta["note"],
+                           inc=old_meta["allowed_incomings"], out=old_meta["allowed_outgoings"])
+            name = new_name
+        self._meta_set(
+            guid_for(kind, name), kind,
+            note=data.get("note"),
+            inc=data.get("allowed_incomings"),
+            out=data.get("allowed_outgoings") if kind == "user_group" else None,
+        )
+        self._send_json(200, self._group_obj(kind, name))
+
+    def _group_delete(self, kind, guid):
+        perm = "user_groups.edit" if kind == "user_group" else "device_groups.edit"
+        if not self._require(perm):
+            return
+        found = self._find_group(kind, guid)
+        if not found:
+            self._send_json(404, {"error": "group not found"})
+            return
+        gid, name = found
+        if kind == "user_group" and gid == 1:
+            self._send_json(400, {"error": "cannot delete the default group"})
+            return
+        table = "groups" if kind == "user_group" else "device_groups"
+        conn = self._lw_write()
+        try:
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (gid,))
+            if kind == "user_group":
+                conn.execute("UPDATE users SET group_id=1 WHERE group_id=?", (gid,))
+            conn.commit()
+        finally:
+            conn.close()
+        conn = db()
+        try:
+            conn.execute("DELETE FROM group_meta WHERE guid=?", (guid,))
+            conn.execute("DELETE FROM device_group_members WHERE group_guid=?", (guid,))
+            conn.commit()
+        finally:
+            conn.close()
+        self._send_json(200, {"ok": True})
+
+    def _group_add_members(self, kind, guid, raw):
+        perm = "user_groups.edit" if kind == "user_group" else "device_groups.edit"
+        if not self._require(perm):
+            return
+        found = self._find_group(kind, guid)
+        if not found:
+            self._send_json(404, {"error": "group not found"})
+            return
+        gid, name = found
+        items = json.loads(raw.decode("utf-8") or "[]")
+        if kind == "user_group":
+            conn = self._lw_write()
+            try:
+                users = {guid_for("user", u[0]): u[1] for u in conn.execute("SELECT username, id FROM users")}
+                for ug in items:
+                    if ug in users:
+                        conn.execute("UPDATE users SET group_id=? WHERE id=?", (gid, users[ug]))
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = db()
+            try:
+                for did in items:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO device_group_members(group_guid, device_id) VALUES(?,?)",
+                        (guid, str(did)),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        self._send_json(200, {"ok": True})
+
+    def _access_check(self):
+        if not self._require("devices.view"):
+            return
+        q = self._query()
+        user_q = (q.get("user") or [""])[0]
+        device_id = (q.get("device") or [""])[0]
+        via = []
+        allowed = False
+        conn = self._lw()
+        if not conn:
+            self._send_json(503, {"error": "upstream db unavailable"})
+            return
+        try:
+            users = {}
+            for r in conn.execute("SELECT id, username, group_id, is_admin FROM users"):
+                users[r[1]] = {"id": r[0], "group_id": r[2], "is_admin": bool(r[3])}
+            groups = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM groups")}
+            uname = user_q
+            if uname not in users:
+                for name in users:
+                    if guid_for("user", name) == user_q:
+                        uname = name
+                        break
+            peer = conn.execute(
+                "SELECT user_id FROM peers WHERE id=?", (device_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if uname in users and peer:
+            u = users[uname]
+            owner_row = None
+            conn = self._lw()
+            try:
+                owner_row = conn.execute(
+                    "SELECT username FROM users WHERE id=?", (peer[0],)
+                ).fetchone()
+            finally:
+                conn.close()
+            owner = owner_row[0] if owner_row else ""
+            if u["is_admin"]:
+                allowed, via = True, ["admin"]
+            elif owner == uname:
+                allowed, via = True, ["owner"]
+            else:
+                ctx = device_context(device_id)
+                my_group = groups.get(u["group_id"], "")
+                my_meta = self._meta(guid_for("user_group", my_group)) if my_group else {
+                    "allowed_outgoings": []}
+                for rule in my_meta["allowed_outgoings"]:
+                    if rule.get("type") == 1 and rule.get("name") in ctx["device_groups"]:
+                        allowed, via = True, [f"outgoing:{my_group}->{rule['name']}"]
+                    if rule.get("type") == 0 and rule.get("name") == ctx["owner_group"]:
+                        allowed, via = True, [f"outgoing:{my_group}->{rule['name']}"]
+                for dg in ctx["device_groups"]:
+                    dm = self._meta(guid_for("device_group", dg))
+                    for rule in dm["allowed_incomings"]:
+                        if rule.get("type") == 0 and rule.get("name") == my_group:
+                            allowed, via = True, [f"incoming:{dg}<-{my_group}"]
+                        if rule.get("type") == 2 and rule.get("name") == uname:
+                            allowed, via = True, [f"incoming:{dg}<-{uname}"]
+                if ctx["owner_group"]:
+                    om = self._meta(guid_for("user_group", ctx["owner_group"]))
+                    for rule in om["allowed_incomings"]:
+                        if rule.get("type") == 0 and rule.get("name") == my_group:
+                            allowed, via = True, [f"incoming:{ctx['owner_group']}<-{my_group}"]
+                        if rule.get("type") == 2 and rule.get("name") == uname:
+                            allowed, via = True, [f"incoming:{ctx['owner_group']}<-{uname}"]
+        self._send_json(200, {"user": user_q, "device": device_id,
+                              "allowed": allowed, "via": via})
+
     # ---------- 路由 ----------
     def do_POST(self):
         raw = self._read_body()
         path = self.path.split("?")[0]
+        if path != "/api/heartbeat" and not self._guard_json(raw):
+            return
         if path == "/api/heartbeat":
             self._handle_heartbeat(raw)
         elif path.startswith("/api/strategies"):
             self._handle_strategies("POST", path, raw)
         elif path == "/api/tokens":
             self._handle_tokens("POST", path, raw)
+        elif path == "/api/user-groups":
+            self._group_create("user_group", raw)
+        elif path == "/api/device-groups":
+            self._group_create("device_group", raw)
+        elif path.startswith("/api/user-groups/"):
+            self._group_add_members("user_group", path.rsplit("/", 1)[-1], raw)
+        elif path.startswith("/api/device-groups/"):
+            self._group_add_members("device_group", path.rsplit("/", 1)[-1], raw)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -675,11 +1125,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._audits(which)
             else:
                 self._send_json(404, {"error": "not found"})
+        elif path == "/api/access-check":
+            self._access_check()
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_PATCH(self):
+        raw = self._read_body()
+        if not self._guard_json(raw):
+            return
+        path = self.path.split("?")[0]
+        if path.startswith("/api/user-groups/"):
+            self._group_update("user_group", path.rsplit("/", 1)[-1], raw)
+        elif path.startswith("/api/device-groups/"):
+            self._group_update("device_group", path.rsplit("/", 1)[-1], raw)
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_PUT(self):
         raw = self._read_body()
+        if not self._guard_json(raw):
+            return
         path = self.path.split("?")[0]
         if path.startswith("/api/strategies"):
             self._handle_strategies("PUT", path, raw)
@@ -692,6 +1158,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_strategies("DELETE", path, b"")
         elif path.startswith("/api/tokens/"):
             self._handle_tokens("DELETE", path, b"")
+        elif path.startswith("/api/user-groups/"):
+            self._group_delete("user_group", path.rsplit("/", 1)[-1])
+        elif path.startswith("/api/device-groups/"):
+            self._group_delete("device_group", path.rsplit("/", 1)[-1])
         else:
             self._send_json(404, {"error": "not found"})
 

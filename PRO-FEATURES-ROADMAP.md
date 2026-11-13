@@ -12,7 +12,7 @@
 | 1 | WebSocket 客户端接入（ws://） | ✅ | hbbs 补丁（本仓库 ws 分支），生产已验证开/关 WS 均可连接 |
 | 2 | 账号体系（用户注册/登录、个人地址簿） | ✅ | lejianwen/rustdesk-api 提供，客户端登录 API 地址即用；地址簿可多本、可共享给其他用户 |
 | 3 | Web 管理控制台（设备/用户管理） | ✅ | lejianwen Web Admin：用户、设备、地址簿、标签、群组、OAuth、LDAP 配置与日志管理齐全 |
-| 4 | 用户组 / 设备组与按组访问控制 | ◐ | lejianwen 有共享组/普通组与地址簿共享；与 Pro 按组做设备授权的粒度差待补 |
+| 4 | 用户组 / 设备组与按组访问控制 | ◐ | 本仓库 strategy/ 服务已补：用户组/设备组 CRUD（对齐 Pro 的 allowed_incomings/allowed_outgoings 规则模型）、策略按用户/组分配解析（设备>用户>组优先级，名字/GUID 双写规范化）、/api/access-check 授权解析；连接级拦截需 hbbs 感知账号身份（lejianwen 自有 hbbs 的 MUST_LOGIN 路线），不在 API 层范围 |
 | 5 | 连接 / 文件传输审计日志 | ✅ | lejianwen 有登录日志、链接日志、文件传输日志 |
 | 6 | 安全设置同步 / 策略下发 | ✅ | 独立策略服务（本仓库 strategy/）：客户端心跳 /api/heartbeat 协议与 Pro 完全一致（源码依据为开源客户端 src/hbbs_http/sync.rs），管理 API 对齐官方 res/strategies.py（CRUD/启停/按设备分配）；2026-11-13 部署 DC-02 并实机验证：给 win11 下发 disable-audio 后客户端日志 `strategy updated`、配置落盘，撤销后自动清除。用户/组分配的解析待 #4 一并补强 |
 | 7 | 控制台双因素认证（2FA） | ◐ | 独立 TOTP 网关（本仓库 gate/）以 Nginx auth_request 保护 /_admin/ 与 /api/admin/：未注册时放行、管理员经一次性链接自设口令+录入 TOTP 后强制生效，与控制台自身登录构成双层防护；2026-11-13 部署 DC-02，全流程在同构测试实例验证通过，生产待管理员完成一次性注册 |

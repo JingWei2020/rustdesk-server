@@ -14,7 +14,9 @@
 管理接口与官方 `res/strategies.py` 完全同形：
 `GET/POST /api/strategies`、`GET/PUT/DELETE /api/strategies/{guid}`、
 `PUT /api/strategies/{guid}/status`、`POST /api/strategies/assign {strategy, peers, users, groups}`。
-当前仅 peers（设备 ID）分配即时生效；users/groups 分配会落库，由授权层解析（路线图 #4）。
+分配解析（路线图 #4 ✅）：心跳时按 设备直配 > 设备所有者 > 组（所有者所在用户组 /
+设备所在组）优先级解析，同级取最新修改；分配与取消分配都接受名字或 GUID 两种写法
+（写入时规范化为 GUID），混用不会出现“分得上、取消不掉”。
 
 ## 2. 细粒度 API 令牌（路线图 #9 ✅）
 
@@ -42,6 +44,27 @@
 | `GET /api/strategies` 等 | strategies.view / strategies.edit |
 
 例外：`/api/users` 在 lejianwen 本有同名路由——请求不带本层令牌时原样透传上游。
+
+## 4. 分组与访问规则（路线图 #4 ◐）
+
+对齐 Pro 的组规则模型（`res/user-groups.py`、`res/device-groups.py`）：
+组对象带 `allowed_incomings` / `allowed_outgoings` 规则数组，
+规则元素 `{type, name}`：type 0=用户组、1=设备组、2=用户。
+
+- `POST /api/user-groups {name, note?, allowed_incomings?, allowed_outgoings?}`
+  （user_groups.edit）：写入 lejianwen `groups` 表，规则存本层 `group_meta`；
+- `PATCH /api/user-groups/{guid}` 改名/改规则（GUID 由组名派生，改名自动迁移元数据）；
+- `DELETE /api/user-groups/{guid}`：成员回落默认组；默认组（id=1）禁删；
+- `POST /api/user-groups/{guid}`，请求体 `[user_guids]`：把用户移入该组（写 users.group_id）；
+- 设备组同理（`device_groups.edit`），成员关系存本层 `device_group_members`
+  （不写 peers.group_id，避免与 lejianwen 自身分组语义冲突）；
+- `GET /api/access-check?user=<名|GUID>&device=<ID>`（devices.view）：
+  解析某用户对某设备的授权来源（admin / owner / outgoing / incoming 规则），
+  返回 `{allowed, via[]}`。
+
+边界：连接级拦截（在 hbbs 撮合时按组拒绝连接）需要 hbbs 感知登录账号身份，
+属于 lejianwen 自有 hbbs 分支的 MUST_LOGIN 模式路线，不在 API 层实现范围；
+本层交付的是 Pro 同形的规则模型、解析接口与策略联动。
 
 ## 部署
 
