@@ -17,7 +17,7 @@
 | 6 | 安全设置同步 / 策略下发 | ✅ | 独立策略服务（本仓库 strategy/）：客户端心跳 /api/heartbeat 协议与 Pro 完全一致（源码依据为开源客户端 src/hbbs_http/sync.rs），管理 API 对齐官方 res/strategies.py（CRUD/启停/按设备分配）；2026-11-13 部署 DC-02 并实机验证：给 win11 下发 disable-audio 后客户端日志 `strategy updated`、配置落盘，撤销后自动清除。用户/组分配的解析待 #4 一并补强 |
 | 7 | 控制台双因素认证（2FA） | ◐ | 独立 TOTP 网关（本仓库 gate/）以 Nginx auth_request 保护 /_admin/ 与 /api/admin/：未注册时放行、管理员经一次性链接自设口令+录入 TOTP 后强制生效，与控制台自身登录构成双层防护；2026-11-13 部署 DC-02，全流程在同构测试实例验证通过，生产待管理员完成一次性注册 |
 | 8 | OIDC / LDAP 单点登录 | ✅ | lejianwen 支持 GitHub / Google / OIDC 授权登录与 LDAP（AD、OpenLDAP），部署时配置即可 |
-| 9 | API 令牌（细粒度权限） | ⏳ | lejianwen 有 JWT 与令牌有效期管理；Pro 式按权限划分的 API 令牌待补 |
+| 9 | API 令牌（细粒度权限） | ✅ | 本仓库 strategy/ 服务已实现：Pro 词汇权限表的作用域令牌（签发/列表/吊销/过期，哈希落库），覆盖 strategies/devices/users/user-groups/device-groups/audits 读写校验；官方 res/strategies.py 与 res/devices.py 已用作用域令牌在生产实测通过（2026-11-13） |
 | 10 | 多中继节点 + 自动就近调度 | ⏳ | hbbs/hbbr 层实现：多 hbbr 注册、心跳与按延迟/负载下发 |
 | 11 | WSS（WebSocket over TLS） | ◐ | Web 客户端可配 wss Host；桌面客户端 WSS 经反向代理终止，待集成验证 |
 | 12 | 定制客户端生成 | ◐ | 已用单文件安装包平替（官方 1.5.3 + magic 文件名 + 装后写配置）；控制台一键生成待做 |
