@@ -36,6 +36,17 @@ LISTEN_PORT = int(os.environ.get("GATE_LISTEN_PORT", "21215"))
 COOKIE_NAME = "rdgate"
 COOKIE_TTL = 12 * 3600
 
+# 定制客户端页展示的服务器参数（公开信息：公钥本身就是给客户端用的）
+CLIENT_PARAMS = {
+    "id_server": os.environ.get("CLIENT_ID_SERVER", "23.95.243.27:21116"),
+    "relay_server": os.environ.get("CLIENT_RELAY_SERVER", "23.95.243.27:21117"),
+    "api_server": os.environ.get("CLIENT_API_SERVER", "https://rd.ljwc.eu.cc"),
+    "key": os.environ.get("CLIENT_KEY", "AgY96DpUBIH6MvNSM56itLNqCHCZ7FWXjrWjqINCqvo="),
+}
+CLIENT_PACKAGE = os.environ.get(
+    "CLIENT_PACKAGE", "/opt/rustdesk-gate/downloads/RustDesk-1.5.3-JingWei.exe"
+)
+
 _fails = {}  # ip -> [timestamps]
 
 
@@ -321,11 +332,67 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self._redirect("/_admin/", cookie=make_cookie(st))
 
+    # ---------- 定制客户端页（一键生成定制客户端的开源平替） ----------
+    def _gate_authed(self):
+        st = load_state()
+        return bool(st.get("enrolled")) and check_cookie(st, self.headers.get("Cookie", ""))
+
+    def _client_page(self):
+        p = CLIENT_PARAMS
+        magic = f"rustdesk-host={p['id_server'].split(':')[0]},key={p['key']},.exe"
+        body = f"""
+        <h1>定制客户端</h1>
+        <p>预置好本服务器参数的客户端安装包，装完即连自建服务器，无需再改设置。</p>
+        <label>ID 服务器</label><div class="secret">{p['id_server']}</div>
+        <label>中继服务器</label><div class="secret">{p['relay_server']}</div>
+        <label>API 服务器</label><div class="secret">{p['api_server']}</div>
+        <label>公钥 Key</label><div class="secret">{p['key']}</div>
+        <form method="get" action="/gate/client/download">
+          <button type="submit">下载定制客户端（Windows，1.5.3）</button>
+        </form>
+        <p>也可以用官方安装包自助定制：把官方安装器改名为
+        <code>{magic}</code> 再运行，可自动带入 ID 服务器与公钥
+        （中继与 API 仍需在设置里补一次）。</p>
+        <p>重新打包说明与脚本在代码仓库 client-package/ 目录（Windows 上运行
+        build 即可按当前参数重新生成安装包）。</p>"""
+        return page("定制客户端", body)
+
+    def _client_download(self):
+        try:
+            size = os.path.getsize(CLIENT_PACKAGE)
+        except Exception:
+            self._send(404, "package not found", "text/plain")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header(
+            "Content-Disposition",
+            'attachment; filename="RustDesk-1.5.3-JingWei.exe"',
+        )
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(CLIENT_PACKAGE, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     # ---------- 路由 ----------
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/auth":
             self._auth()
+        elif path == "/gate/client":
+            if self._gate_authed():
+                self._send(200, self._client_page())
+            else:
+                self._redirect("/gate/login")
+        elif path == "/gate/client/download":
+            if self._gate_authed():
+                self._client_download()
+            else:
+                self._redirect("/gate/login")
         elif path == "/gate/login":
             st = load_state()
             if st.get("enrolled"):
