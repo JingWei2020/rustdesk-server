@@ -20,7 +20,7 @@
 | 9 | API 令牌（细粒度权限） | ✅ | 本仓库 strategy/ 服务已实现：Pro 词汇权限表的作用域令牌（签发/列表/吊销/过期，哈希落库），覆盖 strategies/devices/users/user-groups/device-groups/audits 读写校验；官方 res/strategies.py 与 res/devices.py 已用作用域令牌在生产实测通过（2026-11-13） |
 | 10 | 多中继节点 + 自动就近调度 | ◐ | 已实现并上线（补丁 v3）：hbbs 支持多中继列表（上游自带健康剔除），选择逻辑由轮换改为按双方 IP 国家/大区分级就近（MMDB 国家库，RELAY_GEO_OVERRIDES 可覆盖），每次选择有日志、可用控制台 tg 命令验证；生产已双中继（DC-02+DC-03，均洛杉矶）并演练过故障剔除/恢复。剩余：亚太中继节点待一台有可用公网端口的亚洲服务器（SG/HK NAT 的端口映射未确认），加上后中国侧连接即可就近走亚太（hbbs 参数加一项，无需改代码） |
 | 11 | WSS（WebSocket over TLS） | ✅ | 已上线并完成真机集成验证：客户端按源码规则（域名 rendezvous + https API）在 `wss://<域名>/ws/id`、`/ws/relay` 两个端点走 443，Nginx 反代到 hbbs 21118 / hbbr 21119；win11 客户端临时切域名实测经 Cloudflare→Nginx 注册成功（hbbs 日志 update_pk 来源为 CF 边缘 IP），测后已恢复原配置。备注：经 WSS 注册的设备其 IP 在 hbbs 侧为代理出口 IP，就近选路对这类设备会退化为轮换；现有常驻设备继续走直连 WS（保真实 IP） |
-| 12 | 定制客户端生成 | ✅ | 控制台（2FA 网关后 `/gate/client`）提供当前服务器参数展示 + 预置四项参数的单文件安装包下载 + 官方安装器 magic 文件名自助定制法；打包脚本在仓库 client-package/（IExpress：官方安装器 magic 名 + 装后写配置，Windows 上一条命令重打包）。注：EXE 生成依赖 Windows 工具链，故控制台分发的是按生产参数预生成的包，参数变更时在 Windows 上重跑打包脚本 |
+| 12 | 定制客户端生成 | ✅ | 控制台（2FA 网关后 `/gate/client`）提供当前服务器参数展示 + 预置四项参数的单文件安装包下载 + 官方安装器 magic 文件名自助定制法；打包脚本在仓库 client-package/（IExpress：官方安装器 magic 名 + 装后写配置，Windows 上一条命令重打包）。注：EXE 生成依赖 Windows 工具链，故控制台分发的是按生产参数预生成的包，参数变更时在 Windows 上重跑打包脚本。2026-11-14 起分发品牌版「JingWei远程控制」（中国红 + 金色五角星）：Windows 包在装后把主程序换成 brand_exe.py（LIEF 资源手术）改过图标与产品名的版本、快捷方式改名并指向品牌图标；Android 包为官方 APK 经 apktool 改应用名与启动图标、换自签证书重签（签名与官方不同，须先卸载官方版）；/gate/client 同时提供 Windows 与 Android 两个下载 |
 | 13 | 自托管 Web 客户端（浏览器远控） | ◐ | lejianwen 自带 Web Client：自动同步 API/ID/Key/地址簿，支持游客临时分享链接；非官方实现 |
 | 14 | WebRTC 传输（Pro 1.8.7 新增） | ⏳ | 涉及客户端/服务端协议，单独立项评估 |
 

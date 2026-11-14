@@ -27,3 +27,21 @@
 
 控制台网关（仓库 `gate/`）在完成双因素登录后提供 `/gate/client` 页：
 展示当前服务器参数、提供本包下载、附官方安装器的 magic 文件名自助定制法。
+
+## 品牌版（2026-11-14，「JingWei远程控制」）
+
+在预置参数之上再做品牌定制：中国红底 + 金色五角星图标、产品名
+「JingWei远程控制」。应用内 Flutter 界面（标题/主题）不在此列，
+改它需要 fork 客户端源码全量重编。
+
+- Windows：setcfg.ps1 v3 在写完配置后，把安装目录的 RustDesk.exe
+  换成品牌版（原版备份为 RustDesk.exe.bak-stock），并把桌面/开始菜单
+  快捷方式改名为「JingWei远程控制」且指向 brand.ico。品牌版主程序由
+  `brand_exe.py` 制作：LIEF 改 RT_ICON 各尺寸叶子为 brand.ico 的 PNG
+  数据并重建 RT_GROUP_ICON（rcedit 改不动本程序图标、ResourceHacker
+  无头会话不可靠）。brand.ico 由品牌 PNG 图标集生成，随安装包分发（推送工具只收文本文件，未入库）。
+- Android：官方 APK 用 apktool 解包，改 AndroidManifest 的
+  android:label 与各密度 ic_launcher / ic_launcher_foreground（前景为
+  星形、背景色 #DE2910），重编后用自有 keystore 重签（v1+v2+v3）。
+  签名与官方不同：安装前必须先卸载官方版，装好后手动填一次服务器参数。
+- 分发：/gate/client 页同时提供 Windows 与 Android 两个品牌包下载。

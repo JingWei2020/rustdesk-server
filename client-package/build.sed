@@ -24,8 +24,8 @@ SourceFiles=SourceFiles
 InstallPrompt=
 DisplayLicense=
 FinishMessage=
-TargetName=C:\tools\RustDesk-1.5.3-JingWei.exe
-FriendlyName=RustDesk 1.5.3 JingWei
+TargetName=C:\tools\JingWeiRemote-1.5.3.exe
+FriendlyName=JingWei Remote 1.5.3
 AppLaunched=setup.cmd
 PostInstallCmd=<None>
 AdminQuietInstCmd=
@@ -33,9 +33,13 @@ UserQuietInstCmd=
 FILE0="rustdesk-setup.exe"
 FILE1="setup.cmd"
 FILE2="setcfg.ps1"
+FILE3="brand.ico"
+FILE4="RustDesk-branded.exe"
 [SourceFiles]
-SourceFiles0=C:\tools\sfxbuild\
+SourceFiles0=C:\tools\sfxbuild2\
 [SourceFiles0]
 %FILE0%=
 %FILE1%=
 %FILE2%=
+%FILE3%=
+%FILE4%=

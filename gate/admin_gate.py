@@ -46,6 +46,9 @@ CLIENT_PARAMS = {
 CLIENT_PACKAGE = os.environ.get(
     "CLIENT_PACKAGE", "/opt/rustdesk-gate/downloads/RustDesk-1.5.3-JingWei.exe"
 )
+CLIENT_APK = os.environ.get(
+    "CLIENT_APK", "/opt/rustdesk-gate/downloads/JingWeiRemote-1.5.3.apk"
+)
 
 _fails = {}  # ip -> [timestamps]
 
@@ -622,8 +625,13 @@ class Handler(BaseHTTPRequestHandler):
         <label>API 服务器</label><div class="secret">{p['api_server']}</div>
         <label>公钥 Key</label><div class="secret">{p['key']}</div>
         <form method="get" action="/gate/client/download">
-          <button type="submit">下载定制客户端（Windows，1.5.3）</button>
+          <button type="submit">下载 Windows 客户端：JingWei远程控制（1.5.3，中国红金星版）</button>
         </form>
+        <form method="get" action="/gate/client/download-apk">
+          <button type="submit">下载 Android 客户端：JingWei远程控制（1.5.3，中国红金星版）</button>
+        </form>
+        <p>Android 包为重新签名版本，与官方版签名不同：先卸载官方 RustDesk
+        再安装此包，装好后在设置里填一次上面的四个服务器参数。</p>
         <p>也可以用官方安装包自助定制：把官方安装器改名为
         <code>{magic}</code> 再运行，可自动带入 ID 服务器与公钥
         （中继与 API 仍需在设置里补一次）。</p>
@@ -641,11 +649,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header(
             "Content-Disposition",
-            'attachment; filename="RustDesk-1.5.3-JingWei.exe"',
+            'attachment; filename="JingWeiRemote-1.5.3.exe"',
         )
         self.send_header("Content-Length", str(size))
         self.end_headers()
         with open(CLIENT_PACKAGE, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def _client_download_apk(self):
+        try:
+            size = os.path.getsize(CLIENT_APK)
+        except Exception:
+            self._send(404, "package not found", "text/plain")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header(
+            "Content-Disposition",
+            'attachment; filename="JingWeiRemote-1.5.3.apk"',
+        )
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(CLIENT_APK, "rb") as f:
             while True:
                 chunk = f.read(1 << 20)
                 if not chunk:
@@ -895,6 +924,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/gate/client/download":
             if self._gate_authed():
                 self._client_download()
+            else:
+                self._redirect("/gate/login")
+        elif path == "/gate/client/download-apk":
+            if self._gate_authed():
+                self._client_download_apk()
             else:
                 self._redirect("/gate/login")
         elif path == "/gate/security":

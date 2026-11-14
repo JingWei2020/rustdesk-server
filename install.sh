@@ -25,7 +25,7 @@
 #
 # 行为说明：
 #   - 二进制来源优先级：脚本同目录 bin/ 下的现成文件 > 本仓库 Release
-#     （v1.1.16-ws2）的预编译包 > 从源码编译。
+#     （v1.1.16-ws3）的预编译包 > 从源码编译。
 #   - 已存在的 /var/lib/rustdesk-server（密钥 id_ed25519* 与设备库）绝不
 #     覆盖——重装后客户端 Key 不变。已存在的 /usr/bin/hbbs、hbbr 会先
 #     备份为 *.bak-<时间戳> 再替换。
@@ -34,7 +34,7 @@ set -euo pipefail
 
 REPO="JingWei2020/rustdesk-server"
 BRANCH="ws-1.1.16"
-RELEASE_TAG="v1.1.16-ws2"
+RELEASE_TAG="v1.1.16-ws3"
 RELEASE_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG"
 API_TARBALL="https://github.com/lejianwen/rustdesk-api/releases/download/v2.7/linux-amd64.tar.gz"
 

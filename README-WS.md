@@ -25,6 +25,19 @@ hbbs 的 `-r` 本就接受逗号分隔的中继列表，上游自带健康检查
 21117/tcp（与 21119/tcp），然后把 `host:21117` 追加进 hbbs 的 `-r` 列表重启即可。
 生产现状：DC-02 与 DC-03 双中继（均洛杉矶）；亚太中继待亚洲服务器的公网端口确认。
 
+## 常驻连接会话信令修复（补丁 v4）
+
+v1–v3 让 WebSocket 注册跑通了，但两个都走 WebSocket 注册的对端仍然建不了会话：
+上游 `handle_tcp` 在处理 PunchHoleRequest / RequestRelay 时会 `sink.take()`，
+把连接唯一的发送端移进 `tcp_punch`（那是按一次性打洞连接设计的）。
+常驻注册连接被 take 后，中继响应、打洞响应、服务器推送全部静默丢失，
+hbbr 侧收不到任何中继请求，客户端报「无法通过注册服务器建立连接」。
+
+v4 引入 `PunchDest`：常驻连接改为把自身的推送通道登记进 `tcp_punch`
+（不消耗、随连接关闭清理），`send_to_tcp` / `send_to_tcp_sync` 优先走通道，
+Sink 路径保留原一次性语义。2026-11-14 生产实测：双端在「禁用 UDP 开 +
+WebSocket 开」下注册并成功互连。
+
 ## 为什么打补丁
 
 开源版 hbbs 的 TCP/WebSocket 通道对注册请求（RegisterPk）写死返回 `NOT_SUPPORT`：

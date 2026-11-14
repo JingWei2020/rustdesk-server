@@ -22,6 +22,16 @@
 #            每次选择打 INFO 日志（relay select: ...），可用控制台命令
 #            tg <ip1> <ip2>（连 hbbs 的 21115 端口本地回环）直接验证。
 #            中继健康剔除是上游自带机制（check_relay_servers），本补丁未动。
+#         8. （v4）修复 WS/TCP 常驻连接的会话信令被"吞 sink"掐断的问题：
+#            上游 handle_tcp 在 PunchHoleRequest/RequestRelay 分支里
+#            sink.take() 把连接唯一的发送端移进 tcp_punch（按一次性连接
+#            设计）；常驻注册连接被 take 后，后续所有服务器下行消息
+#            （中继响应/打洞响应/推送）全部静默丢失，WS 注册的对端永远
+#            建不了会话（客户端报「无法通过注册服务器建立连接」，hbbr
+#            侧无任何中继请求）。v4 改为把连接的推送通道（peer_tx）以
+#            PunchDest::Chan 登记进 tcp_punch（不消耗、随连接关闭清
+#            理），send_to_tcp/send_to_tcp_sync 优先走通道，Sink 路径
+#            保留原一次性语义。2026-11-14 实测踩中并修复。
 #       编译为 x86_64-unknown-linux-musl 静态二进制，可直接替换 .deb 装的 hbbs。
 #       脚本可重复运行：已存在的源码树会先重置为官方版本再重新打补丁。
 #

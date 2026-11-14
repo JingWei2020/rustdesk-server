@@ -11,10 +11,27 @@ index e5162ee..3719f61 100644
  clap = "2"
  rust-ini = "0.18"
 diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
-index dff45eb..20dcac0 100644
+index dff45eb..00d626b 100644
 --- a/src/rendezvous_server.rs
 +++ b/src/rendezvous_server.rs
-@@ -57,6 +57,100 @@ enum Sink {
+@@ -54,9 +54,117 @@ enum Sink {
+     TcpStream(TcpStreamSink),
+     Ws(WsSink),
+ }
++
++// Patched (v4): a punch/relay reply destination. Upstream's choreography
++// moves the connection's sink into tcp_punch (sink.take()), which assumes
++// one-shot connections. Mediator connections (TCP/WebSocket) are
++// long-lived: taking their sink silently mutes every later
++// server->client message on them (relay responses, punch responses,
++// pushes), so sessions for websocket-registered peers could never be
++// established. Persistent connections therefore register their push
++// channel instead; the entry is refreshed on every punch/relay request
++// and removed when the connection closes.
++enum PunchDest {
++    Sink(Sink),
++    Chan(mpsc::UnboundedSender<Bytes>),
++}
  type Sender = mpsc::UnboundedSender<Data>;
  type Receiver = mpsc::UnboundedReceiver<Data>;
  static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
@@ -115,15 +132,17 @@ index dff45eb..20dcac0 100644
  type RelayServers = Vec<String>;
  const CHECK_RELAY_TIMEOUT: u64 = 3_000;
  static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
-@@ -82,6 +176,7 @@ struct Inner {
+@@ -81,7 +189,8 @@ struct Inner {
+ 
  #[derive(Clone)]
  pub struct RendezvousServer {
-     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
++    tcp_punch: Arc<Mutex<HashMap<SocketAddr, PunchDest>>>,
 +    ws_peers: Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>,
      pm: PeerMap,
      tx: Sender,
      relay_servers: Arc<RelayServers>,
-@@ -129,6 +224,7 @@ impl RendezvousServer {
+@@ -129,6 +238,7 @@ impl RendezvousServer {
          };
          let mut rs = Self {
              tcp_punch: Arc::new(Mutex::new(HashMap::new())),
@@ -131,7 +150,7 @@ index dff45eb..20dcac0 100644
              pm,
              tx: tx.clone(),
              relay_servers: Default::default(),
-@@ -479,6 +575,7 @@ impl RendezvousServer {
+@@ -479,28 +589,35 @@ impl RendezvousServer {
          addr: SocketAddr,
          key: &str,
          ws: bool,
@@ -139,7 +158,35 @@ index dff45eb..20dcac0 100644
      ) -> bool {
          if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
              match msg_in.union {
-@@ -500,7 +597,7 @@ impl RendezvousServer {
+                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
+-                    // there maybe several attempt, so sink can be none
+-                    if let Some(sink) = sink.take() {
+-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+-                    }
++                    // Patched (v4): register this persistent connection's
++                    // push channel as the reply destination; never take
++                    // its sink (that would mute the connection for good).
++                    self.tcp_punch
++                        .lock()
++                        .await
++                        .insert(try_into_v4(addr), PunchDest::Chan(peer_tx.clone()));
+                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                     return true;
+                 }
+                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+-                    // there maybe several attempt, so sink can be none
+-                    if let Some(sink) = sink.take() {
+-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+-                    }
++                    // Patched (v4): register this persistent connection's
++                    // push channel as the reply destination; never take
++                    // its sink (that would mute the connection for good).
++                    self.tcp_punch
++                        .lock()
++                        .await
++                        .insert(try_into_v4(addr), PunchDest::Chan(peer_tx.clone()));
+                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                         let mut msg_out = RendezvousMessage::new();
                          rf.socket_addr = AddrMangle::encode(addr).into();
                          msg_out.set_request_relay(rf);
                          let peer_addr = peer.read().await.socket_addr;
@@ -148,7 +195,7 @@ index dff45eb..20dcac0 100644
                      }
                      return true;
                  }
-@@ -545,19 +642,159 @@ impl RendezvousServer {
+@@ -545,19 +662,159 @@ impl RendezvousServer {
                      msg_out.set_test_nat_response(res);
                      Self::send_to_sink(sink, msg_out).await;
                  }
@@ -312,7 +359,21 @@ index dff45eb..20dcac0 100644
      }
  
      #[inline]
-@@ -818,6 +1055,40 @@ impl RendezvousServer {
+@@ -812,26 +1069,93 @@ impl RendezvousServer {
+ 
+     #[inline]
+     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
+-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
++        // Patched (v4): prefer the persistent connection's channel.
++        if self.send_via_chan(&msg, addr).await {
++            return;
++        }
++        let dest = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+         tokio::spawn(async move {
+-            Self::send_to_sink(&mut tcp, msg).await;
++            if let Some(PunchDest::Sink(mut s)) = dest {
++                Self::send_to_sink_ref(&mut s, msg).await;
++            }
          });
      }
  
@@ -351,9 +412,75 @@ index dff45eb..20dcac0 100644
 +    }
 +
      #[inline]
++    async fn send_to_sink_ref(sink: &mut Sink, msg: RendezvousMessage) {
++        if let Ok(bytes) = msg.write_to_bytes() {
++            match sink {
++                Sink::TcpStream(s) => {
++                    allow_err!(s.send(Bytes::from(bytes)).await);
++                }
++                Sink::Ws(ws) => {
++                    allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
++                }
++            }
++        }
++    }
++
      async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
          if let Some(sink) = sink.as_mut() {
-@@ -855,7 +1126,7 @@ impl RendezvousServer {
++            Self::send_to_sink_ref(sink, msg).await;
++        }
++    }
++
++    // Patched (v4): try to deliver via a registered channel destination
++    // (persistent mediator connection). Channel entries are not consumed:
++    // they belong to the connection and are removed when it closes.
++    async fn send_via_chan(
++        &mut self,
++        msg: &RendezvousMessage,
++        addr: SocketAddr,
++    ) -> bool {
++        let chan = {
++            let map = self.tcp_punch.lock().await;
++            match map.get(&try_into_v4(addr)) {
++                Some(PunchDest::Chan(tx)) => Some(tx.clone()),
++                _ => None,
++            }
++        };
++        if let Some(tx) = chan {
+             if let Ok(bytes) = msg.write_to_bytes() {
+-                match sink {
+-                    Sink::TcpStream(s) => {
+-                        allow_err!(s.send(Bytes::from(bytes)).await);
+-                    }
+-                    Sink::Ws(ws) => {
+-                        allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+-                    }
+-                }
++                return tx.send(Bytes::from(bytes)).is_ok();
+             }
+         }
++        false
+     }
+ 
+     #[inline]
+@@ -840,8 +1164,14 @@ impl RendezvousServer {
+         msg: RendezvousMessage,
+         addr: SocketAddr,
+     ) -> ResultType<()> {
+-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+-        Self::send_to_sink(&mut sink, msg).await;
++        // Patched (v4): prefer the persistent connection's channel.
++        if self.send_via_chan(&msg, addr).await {
++            return Ok(());
++        }
++        let dest = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
++        if let Some(PunchDest::Sink(mut s)) = dest {
++            Self::send_to_sink_ref(&mut s, msg).await;
++        }
+         Ok(())
+     }
+ 
+@@ -855,7 +1185,7 @@ impl RendezvousServer {
      ) -> ResultType<()> {
          let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
          if let Some(addr) = to_addr {
@@ -362,7 +489,7 @@ index dff45eb..20dcac0 100644
          } else {
              self.send_to_tcp_sync(msg, addr).await?;
          }
-@@ -870,13 +1141,12 @@ impl RendezvousServer {
+@@ -870,13 +1200,12 @@ impl RendezvousServer {
          key: &str,
      ) -> ResultType<()> {
          let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
@@ -382,7 +509,7 @@ index dff45eb..20dcac0 100644
          Ok(())
      }
  
-@@ -916,14 +1186,53 @@ impl RendezvousServer {
+@@ -916,14 +1245,53 @@ impl RendezvousServer {
          self.relay_servers = self.relay_servers0.clone();
      }
  
@@ -439,7 +566,7 @@ index dff45eb..20dcac0 100644
      }
  
      async fn check_cmd(&self, cmd: &str) -> String {
-@@ -1169,22 +1478,52 @@ impl RendezvousServer {
+@@ -1169,25 +1537,55 @@ impl RendezvousServer {
              let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
              let (a, mut b) = ws_stream.split();
              sink = Some(Sink::Ws(a));
@@ -495,7 +622,13 @@ index dff45eb..20dcac0 100644
                  }
              }
          }
+-        if sink.is_none() {
+-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+-        }
 +        self.ws_peers.lock().await.remove(&try_into_v4(addr));
-         if sink.is_none() {
-             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-         }
++        // Patched (v4): the punch destination belongs to this connection;
++        // always drop it when the connection closes.
++        self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+         log::debug!("Tcp connection from {:?} closed", addr);
+         Ok(())
+     }
